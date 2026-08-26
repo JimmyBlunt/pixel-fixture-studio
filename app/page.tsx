@@ -283,20 +283,12 @@ function download(name: string, content: string, type: string) {
   setTimeout(() => URL.revokeObjectURL(link.href), 1000);
 }
 
-function MapCanvas({ points, panels, selectionMode, onSelection, view }: { points: MapPoint[]; panels: Panel[]; selectionMode: boolean; onSelection: (indices: number[]) => void; view: string }) {
+function MapCanvas({ points, panels, selectionMode, onSelection, camera, onCameraChange }: { points: MapPoint[]; panels: Panel[]; selectionMode: boolean; onSelection: (indices: number[]) => void; camera: Camera; onCameraChange: (camera: Camera) => void }) {
   const ref = useRef<HTMLCanvasElement>(null);
-  const camera = useRef<Camera>({ yaw: -.5, pitch: -.28, zoom: 1 });
   const drag = useRef<{ x: number; y: number; yaw: number; pitch: number; selecting: boolean } | null>(null);
   const [box, setBox] = useState<{ x1: number; y1: number; x2: number; y2: number } | null>(null);
   const [revision, setRevision] = useState(0);
   const projectedRef = useRef<{ index: number; x: number; y: number }[]>([]);
-
-  useEffect(() => {
-    if (view === 'Top') camera.current = { yaw: 0, pitch: -Math.PI / 2, zoom: camera.current.zoom };
-    else if (view === 'Front') camera.current = { yaw: 0, pitch: 0, zoom: camera.current.zoom };
-    else if (view === 'Side') camera.current = { yaw: -Math.PI / 2, pitch: 0, zoom: camera.current.zoom };
-    else camera.current = { yaw: -.5, pitch: -.28, zoom: camera.current.zoom };
-  }, [view]);
 
   useEffect(() => {
     const canvas = ref.current; if (!canvas) return;
@@ -309,17 +301,17 @@ function MapCanvas({ points, panels, selectionMode, onSelection, view }: { point
       const center: Vec3 = [0, 0, 0]; visible.forEach(item => points[item.index].xyz.forEach((n, i) => center[i] += n / Math.max(visible.length, 1)));
       const rotated = visible.map(item => {
         const p = points[item.index].xyz, x = p[0] - center[0], y = p[1] - center[1], z = p[2] - center[2];
-        const cy = Math.cos(camera.current.yaw), sy = Math.sin(camera.current.yaw), cp = Math.cos(camera.current.pitch), sp = Math.sin(camera.current.pitch);
+        const cy = Math.cos(camera.yaw), sy = Math.sin(camera.yaw), cp = Math.cos(camera.pitch), sp = Math.sin(camera.pitch);
         const x1 = x * cy - z * sy, z1 = x * sy + z * cy, y1 = y * cp - z1 * sp, z2 = y * sp + z1 * cp;
         return { ...item, x: x1, y: y1, z: z2 };
       });
       const span = Math.max(...rotated.map(p => Math.abs(p.x)), ...rotated.map(p => Math.abs(p.y)), 1);
-      const scale = Math.min(rect.width, rect.height) * .39 / span * camera.current.zoom;
+      const scale = Math.min(rect.width, rect.height) * .39 / span * camera.zoom;
       ctx.strokeStyle = 'rgba(137,151,178,.12)'; ctx.lineWidth = 1;
       for (let i = -5; i <= 5; i++) { ctx.beginPath(); ctx.moveTo(rect.width * .08, rect.height / 2 + i * 38); ctx.lineTo(rect.width * .92, rect.height / 2 + i * 38); ctx.stroke(); }
       rotated.sort((a, b) => a.z - b.z);
       projectedRef.current = rotated.map(p => ({ index: p.index, x: rect.width / 2 + p.x * scale, y: rect.height / 2 - p.y * scale }));
-      rotated.forEach((p, i) => { const screen = projectedRef.current[i]; ctx.shadowColor = p.color; ctx.shadowBlur = 8; ctx.fillStyle = p.color; ctx.globalAlpha = .66 + i / Math.max(rotated.length, 1) * .34; ctx.beginPath(); ctx.arc(screen.x, screen.y, Math.max(2, Math.min(4.2, 2.3 * camera.current.zoom)), 0, Math.PI * 2); ctx.fill(); });
+      rotated.forEach((p, i) => { const screen = projectedRef.current[i]; ctx.shadowColor = p.color; ctx.shadowBlur = 8; ctx.fillStyle = p.color; ctx.globalAlpha = .66 + i / Math.max(rotated.length, 1) * .34; ctx.beginPath(); ctx.arc(screen.x, screen.y, Math.max(2, Math.min(4.2, 2.3 * camera.zoom)), 0, Math.PI * 2); ctx.fill(); });
       ctx.globalAlpha = 1; ctx.shadowBlur = 0;
       points.filter(p => p.status !== 'ok').forEach(p => {
         const visiblePoint = projectedRef.current.find(q => q.index === p.sourceIndex); if (!visiblePoint) return;
@@ -328,19 +320,19 @@ function MapCanvas({ points, panels, selectionMode, onSelection, view }: { point
       if (box) { ctx.fillStyle = 'rgba(255,79,135,.12)'; ctx.strokeStyle = '#ff4f87'; ctx.setLineDash([5, 4]); ctx.fillRect(box.x1, box.y1, box.x2 - box.x1, box.y2 - box.y1); ctx.strokeRect(box.x1, box.y1, box.x2 - box.x1, box.y2 - box.y1); ctx.setLineDash([]); }
     };
     render(); const observer = new ResizeObserver(render); observer.observe(canvas); return () => observer.disconnect();
-  }, [points, panels, box, revision, view]);
+  }, [points, panels, box, revision, camera]);
 
   const pointerDown = (event: ReactPointerEvent<HTMLCanvasElement>) => {
     event.currentTarget.setPointerCapture(event.pointerId);
     const r = event.currentTarget.getBoundingClientRect(); const x = event.clientX - r.left, y = event.clientY - r.top;
     const selecting = selectionMode || event.shiftKey;
-    drag.current = { x, y, yaw: camera.current.yaw, pitch: camera.current.pitch, selecting };
+    drag.current = { x, y, yaw: camera.yaw, pitch: camera.pitch, selecting };
     if (selecting) setBox({ x1: x, y1: y, x2: x, y2: y });
   };
   const pointerMove = (event: ReactPointerEvent<HTMLCanvasElement>) => {
     if (!drag.current) return; const r = event.currentTarget.getBoundingClientRect(); const x = event.clientX - r.left, y = event.clientY - r.top;
     if (drag.current.selecting) setBox(old => old ? { ...old, x2: x, y2: y } : null);
-    else { camera.current.yaw = drag.current.yaw + (x - drag.current.x) * .008; camera.current.pitch = Math.max(-1.5, Math.min(1.5, drag.current.pitch + (y - drag.current.y) * .008)); setRevision(v => v + 1); }
+    else { onCameraChange({ ...camera, yaw: drag.current.yaw + (x - drag.current.x) * .008, pitch: Math.max(-1.5, Math.min(1.5, drag.current.pitch + (y - drag.current.y) * .008)) }); setRevision(v => v + 1); }
   };
   const pointerUp = () => {
     if (drag.current?.selecting && box) {
@@ -350,7 +342,7 @@ function MapCanvas({ points, panels, selectionMode, onSelection, view }: { point
     }
     drag.current = null;
   };
-  const wheel = (event: React.WheelEvent<HTMLCanvasElement>) => { event.preventDefault(); camera.current.zoom = Math.max(.3, Math.min(5, camera.current.zoom * Math.exp(-event.deltaY * .001))); setRevision(v => v + 1); };
+  const wheel = (event: React.WheelEvent<HTMLCanvasElement>) => { event.preventDefault(); onCameraChange({ ...camera, zoom: Math.max(.3, Math.min(5, camera.zoom * Math.exp(-event.deltaY * .001))) }); setRevision(v => v + 1); };
 
   return <canvas ref={ref} className={`map-canvas ${selectionMode ? 'selecting' : ''}`} onPointerDown={pointerDown} onPointerMove={pointerMove} onPointerUp={pointerUp} onPointerCancel={pointerUp} onWheel={wheel} aria-label="Interaktive 3D-Vorschau der LED-Koordinaten" />;
 }
@@ -450,7 +442,7 @@ export default function Home() {
   const initial = useMemo(() => analyze(makeDemo()), []);
   const [points, setPoints] = useState(initial.points); const [panels, setPanels] = useState(initial.panels);
   const [fileName, setFileName] = useState('Demo · 3 Panels'); const [pitch, setPitch] = useState(initial.pitch); const [activeId, setActiveId] = useState(initial.panels[0]?.id ?? '');
-  const [view, setView] = useState('3D'); const [selectionMode, setSelectionMode] = useState(false); const [selection, setSelection] = useState<number[]>([]);
+  const [view, setView] = useState('3D'); const [mapCamera, setMapCamera] = useState<Camera>({ yaw: -.5, pitch: -.28, zoom: 1 }); const [stageMode, setStageMode] = useState<'3d' | '2d'>('3d'); const [selectionMode, setSelectionMode] = useState(false); const [selection, setSelection] = useState<number[]>([]);
   const [message, setMessage] = useState('Beispieldaten aktiv — lade deine Pixelblaze JSON-Datei.'); const [error, setError] = useState(''); const [showExport, setShowExport] = useState(false); const [showHelp, setShowHelp] = useState(false); const [showAdjust, setShowAdjust] = useState(false); const [showRepair, setShowRepair] = useState(false);
   const [repairSuggestions, setRepairSuggestions] = useState<RepairSuggestion[]>([]);
   const [settings, setSettings] = useState<ExportSettings>({ universe: 0, channel: 1, channels: 3, ledSize: 6, definition: 'Generic - Pixel RGB' });
@@ -466,12 +458,16 @@ export default function Home() {
       const coords = extractCoordinates(JSON.parse(await file.text()));
       if (coords.length > 20000) throw new Error('Für die interaktive Vorschau sind maximal 20.000 LEDs vorgesehen.');
       const result = analyze(coords); if (!result.panels.length) throw new Error('Keine zusammenhängenden LED-Bereiche erkannt. Nutze eine sauber gescannte Map oder wähle Punkte manuell.');
-      setPoints(result.points); setPanels(result.panels); setActiveId(result.panels[0].id); setPitch(result.pitch); setFileName(file.name); setSelection([]); setRepairSuggestions([]); setShowRepair(false); setShowAdjust(false); setError('');
+      setPoints(result.points); setPanels(result.panels); setActiveId(result.panels[0].id); setPitch(result.pitch); setFileName(file.name); setSelection([]); setRepairSuggestions([]); setShowRepair(false); setShowAdjust(false); setStageMode('3d'); setError('');
       setMessage(`${fmt.format(coords.length)} Slots geladen · ${result.panels.length} Panels automatisch erkannt.`);
     } catch (cause) { setError(cause instanceof Error ? cause.message : 'Die Datei konnte nicht gelesen werden.'); }
     event.target.value = '';
   };
   const togglePanel = (id: string) => setPanels(items => items.map(item => item.id === id ? { ...item, enabled: !item.enabled } : item));
+  const selectView = (nextView: string) => {
+    setView(nextView);
+    setMapCamera(current => nextView === 'Top' ? { yaw: 0, pitch: -Math.PI / 2, zoom: current.zoom } : nextView === 'Front' ? { yaw: 0, pitch: 0, zoom: current.zoom } : nextView === 'Side' ? { yaw: -Math.PI / 2, pitch: 0, zoom: current.zoom } : { yaw: -.5, pitch: -.28, zoom: current.zoom });
+  };
   const addSelection = () => {
     if (!selection.length) { setMessage('Ziehe zuerst im Auswahlmodus einen Rahmen um LEDs.'); return; }
     const id = `manual-${Date.now()}`; const newPanel: Panel = { id, name: `Auswahl ${panels.length + 1}`, indices: [...selection].sort((a, b) => a - b), color: COLORS[panels.length % COLORS.length], enabled: true, transform: { rotation: 0, scale: 1 } };
@@ -532,10 +528,9 @@ export default function Home() {
         </aside>
 
         <section className="stage-card">
-          <div className="stage-toolbar"><div><span className="eyebrow">3D MAP</span><h1>{fileName}</h1></div><div className="stage-actions"><button onClick={() => setShowAdjust(true)}>2D ausrichten</button><button onClick={openRepairReview}>Auto-Repair</button></div><div className="view-switch">{['3D', 'Top', 'Front', 'Side'].map(item => <button key={item} className={view === item ? 'selected' : ''} onClick={() => setView(item)}>{item}</button>)}</div></div>
-          <div className="viewport">
-            <MapCanvas points={points} panels={panels} selectionMode={selectionMode} onSelection={indices => { setSelection(indices); setMessage(`${fmt.format(indices.length)} LEDs im Rahmen markiert.`); }} view={view} />
-            <div className="axis-chip"><i className="x" /> X <i className="y" /> Y <i className="z" /> Z</div><div className="canvas-help">{selectionMode ? 'Rahmen ziehen, um LEDs zu markieren' : 'Ziehen: drehen · Scrollen: zoomen · Shift: auswählen'}</div>
+          <div className="stage-toolbar"><div><span className="eyebrow">{stageMode === '3d' ? '3D MAP' : 'MADMapper 2D · GROSSANSICHT'}</span><h1>{stageMode === '3d' ? fileName : active?.name ?? 'Kein Panel ausgewählt'}</h1></div><div className="stage-actions"><button className="swap-button" onClick={() => setStageMode(mode => mode === '3d' ? '2d' : '3d')}>⇄ {stageMode === '3d' ? '2D groß' : '3D groß'}</button><button onClick={openRepairReview}>Auto-Repair</button></div>{stageMode === '3d' && <div className="view-switch">{['3D', 'Top', 'Front', 'Side'].map(item => <button key={item} className={view === item ? 'selected' : ''} onClick={() => selectView(item)}>{item}</button>)}</div>}</div>
+          <div className={`viewport ${stageMode === '2d' ? 'viewport-2d' : ''}`}>
+            {stageMode === '3d' ? <><MapCanvas points={points} panels={panels} selectionMode={selectionMode} onSelection={indices => { setSelection(indices); setMessage(`${fmt.format(indices.length)} LEDs im Rahmen markiert.`); }} camera={mapCamera} onCameraChange={setMapCamera} /><div className="axis-chip"><i className="x" /> X <i className="y" /> Y <i className="z" /> Z</div><div className="canvas-help">{selectionMode ? 'Rahmen ziehen, um LEDs zu markieren' : 'Ziehen: drehen · Scrollen: zoomen · Shift: auswählen'}</div></> : <><FixturePreview panel={active} points={points} ledSize={settings.ledSize} interactive onTransform={updatePanelTransform} /><div className="stage-2d-controls"><label><span>Rotation</span><input type="range" min="-180" max="180" step="0.1" value={active?.transform.rotation ?? 0} onChange={event => active && updatePanelTransform({ ...active.transform, rotation: Number(event.target.value) })} /><output>{active?.transform.rotation.toFixed(1) ?? '0.0'}°</output></label><div className="stage-snap-buttons"><button onClick={() => snapActive('horizontal')}>↔ Horizontal</button><button onClick={() => snapActive('vertical')}>↕ Vertikal</button></div><label><span>Exportgröße</span><input type="range" min="0.25" max="4" step="0.01" value={active?.transform.scale ?? 1} onChange={event => active && updatePanelTransform({ ...active.transform, scale: Number(event.target.value) })} /><output>{Math.round((active?.transform.scale ?? 1) * 100)} %</output></label><button className="stage-reset" onClick={() => updatePanelTransform({ rotation: 0, scale: 1 })}>Zurücksetzen</button></div><div className="canvas-help">Ziehen: drehen · Mausrad: Exportgröße</div></>}
           </div>
           <div className="stage-footer"><span><b>{fmt.format(points.length)}</b> Slots</span><span><b>{panels.length}</b> Bereiche</span><button className={`warning-button ${placeholders + outliers ? 'warning' : ''}`} onClick={openRepairReview}><b>{placeholders + outliers}</b> Warnungen prüfen</button><span className="status-message">{message}</span></div>
         </section>
@@ -543,7 +538,7 @@ export default function Home() {
         <aside className="rail right-rail">
           <div className="panel-heading"><div><span className="eyebrow">BEREICHE</span><h2>Panels & Export</h2></div><span className="count-chip">{enabledPanels.length}/{panels.length}</span></div>
           <div className="panel-list">{panels.map(panel => <div className={`panel-row ${panel.id === active?.id ? 'chosen' : ''}`} key={panel.id}><button className="panel-main" onClick={() => setActiveId(panel.id)}><span className="color-dot" style={{ background: panel.color }} /><span><strong>{panel.name}</strong><small>{fmt.format(panel.indices.length)} LEDs · #{panel.indices[0]}–{panel.indices.at(-1)}</small></span></button><label className="switch" title="Für Export aktiv"><input type="checkbox" checked={panel.enabled} onChange={() => togglePanel(panel.id)} /><i /></label></div>)}</div>
-          <div className="fixture-preview"><div className="preview-title"><span className="eyebrow">MADMapper 2D-VORSCHAU</span><span>{active?.name ?? '—'}</span></div><FixturePreview panel={active} points={points} ledSize={settings.ledSize} /><div className="preview-metrics"><span>{active ? `${active.transform.rotation.toFixed(1)}°` : '—'}</span><span>{active ? `${Math.round(active.transform.scale * 100)} %` : '—'}</span></div><div className="preview-actions"><button onClick={() => setShowAdjust(true)}>↻ Ausrichten</button><button onClick={openRepairReview}>◇ Auto-Repair</button></div><p>Best-Fit-Ebene · Quellreihenfolge bleibt erhalten</p></div>
+          {stageMode === '3d' ? <div className="fixture-preview"><div className="preview-title"><span className="eyebrow">MADMapper 2D-VORSCHAU</span><span>{active?.name ?? '—'}</span></div><FixturePreview panel={active} points={points} ledSize={settings.ledSize} /><div className="preview-metrics"><span>{active ? `${active.transform.rotation.toFixed(1)}°` : '—'}</span><span>{active ? `${Math.round(active.transform.scale * 100)} %` : '—'}</span></div><div className="preview-actions"><button onClick={() => setStageMode('2d')}>⇄ Groß anzeigen</button><button onClick={openRepairReview}>◇ Auto-Repair</button></div><p>Best-Fit-Ebene · Quellreihenfolge bleibt erhalten</p></div> : <div className="fixture-preview swapped-preview"><div className="preview-title"><span className="eyebrow">3D-ORIENTIERUNG</span><span>{view}</span></div><div className="mini-map-viewport"><MapCanvas points={points} panels={panels} selectionMode={false} onSelection={() => undefined} camera={mapCamera} onCameraChange={setMapCamera} /></div><div className="preview-actions one"><button onClick={() => setStageMode('3d')}>⇄ 3D groß anzeigen</button></div><p>Die Kameraposition bleibt beim Wechsel erhalten.</p></div>}
           <button className="export-button" onClick={() => setShowExport(true)}>Fixture erstellen <span>→</span></button>
         </aside>
       </section>
