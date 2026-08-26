@@ -19,6 +19,7 @@ type RepairSuggestion = {
   selected: boolean;
 };
 type RepairSensitivity = 'conservative' | 'balanced' | 'sensitive';
+type ParsedMap = { coords: Vec3[]; missingIndices: Set<number>; sourceLabel: string; measuredCount: number };
 
 const COLORS = ['#ff4f87', '#8c7cff', '#37d9c5', '#ffae4f', '#4fa8ff', '#d875ff'];
 const fmt = new Intl.NumberFormat('de-DE');
@@ -66,9 +67,36 @@ function extractCoordinates(value: unknown): Vec3[] {
   throw new Error('Erwartet wird ein JSON-Array mit [x, y, z]-Punkten.');
 }
 
-function analyze(coords: Vec3[]) {
+function parseMarimapperCsv(text: string): ParsedMap {
+  const lines = text.replace(/^\uFEFF/, '').split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  if (lines.length < 2) throw new Error('Die Marimapper-CSV enthält keine Messdaten.');
+  const headers = lines[0].split(',').map(header => header.trim().toLowerCase());
+  const column = (name: string) => headers.indexOf(name);
+  const is3d = ['index', 'x', 'y', 'z'].every(name => column(name) >= 0);
+  const is2d = ['index', 'u', 'v'].every(name => column(name) >= 0);
+  if (!is3d && !is2d) throw new Error('Unbekannte CSV-Struktur. Marimapper erwartet index,x,y,z,xn,yn,zn,error oder index,u,v.');
+
+  const measured = new Map<number, Vec3>();
+  lines.slice(1).forEach((line, rowIndex) => {
+    const values = line.split(',').map(value => value.trim());
+    const index = Number(values[column('index')]);
+    const xyz = is3d ? [Number(values[column('x')]), Number(values[column('y')]), Number(values[column('z')])] : [Number(values[column('u')]), Number(values[column('v')]), 0];
+    if (!Number.isInteger(index) || index < 0 || !xyz.every(Number.isFinite)) throw new Error(`Marimapper-Zeile ${rowIndex + 2} enthält ungültige Index- oder Koordinatenwerte.`);
+    if (measured.has(index)) throw new Error(`Der Marimapper-Index ${index} kommt mehrfach vor.`);
+    measured.set(index, xyz as Vec3);
+  });
+  if (!measured.size) throw new Error('Die Marimapper-CSV enthält keine gültigen LEDs.');
+  const maxIndex = Math.max(...measured.keys());
+  if (maxIndex >= 20000) throw new Error('Für die interaktive Vorschau sind maximal 20.000 LED-Slots vorgesehen.');
+  const coords = Array.from({ length: maxIndex + 1 }, (_, index) => measured.get(index) ?? [0, 0, 0] as Vec3);
+  const missingIndices = new Set(coords.map((_, index) => index).filter(index => !measured.has(index)));
+  return { coords, missingIndices, sourceLabel: is3d ? 'Marimapper 3D-CSV' : 'Marimapper 2D-CSV', measuredCount: measured.size };
+}
+
+function analyze(coords: Vec3[], explicitMissing = new Set<number>()) {
   const originCount = coords.filter(([x, y, z]) => x === 0 && y === 0 && z === 0).length;
-  const candidates = coords.map((xyz, sourceIndex) => ({ xyz, sourceIndex })).filter(p => !(originCount > 1 && p.xyz[0] === 0 && p.xyz[1] === 0 && p.xyz[2] === 0));
+  const isPlaceholder = (xyz: Vec3, sourceIndex: number) => explicitMissing.has(sourceIndex) || (originCount > 1 && xyz[0] === 0 && xyz[1] === 0 && xyz[2] === 0);
+  const candidates = coords.map((xyz, sourceIndex) => ({ xyz, sourceIndex })).filter(point => !isPlaceholder(point.xyz, point.sourceIndex));
   const nearest = candidates.map((point, i) => {
     let best = Infinity;
     for (let j = 0; j < candidates.length; j++) if (i !== j) best = Math.min(best, dist(point.xyz, candidates[j].xyz));
@@ -87,7 +115,7 @@ function analyze(coords: Vec3[]) {
   const clustered = new Set(clusters.flat());
   const points: MapPoint[] = coords.map((xyz, sourceIndex) => ({
     sourceIndex, xyz,
-    status: originCount > 1 && xyz[0] === 0 && xyz[1] === 0 && xyz[2] === 0 ? 'placeholder' : clustered.has(sourceIndex) ? 'ok' : 'outlier',
+    status: isPlaceholder(xyz, sourceIndex) ? 'placeholder' : clustered.has(sourceIndex) ? 'ok' : 'outlier',
   }));
   const panels: Panel[] = clusters.map((indices, i) => ({ id: `panel-${Date.now()}-${i}`, name: `Panel ${String(i + 1).padStart(2, '0')}`, indices: indices.sort((a, b) => a - b), color: COLORS[i % COLORS.length], enabled: true, transform: { rotation: 0, scale: 1, flipX: false, flipY: false } }));
   return { points, panels, pitch, originCount, outliers: points.filter(p => p.status === 'outlier').length };
@@ -461,7 +489,7 @@ export default function Home() {
   const [points, setPoints] = useState(initial.points); const [panels, setPanels] = useState(initial.panels);
   const [fileName, setFileName] = useState('Demo · 3 Panels'); const [pitch, setPitch] = useState(initial.pitch); const [activeId, setActiveId] = useState(initial.panels[0]?.id ?? '');
   const [view, setView] = useState('3D'); const [mapCamera, setMapCamera] = useState<Camera>({ yaw: -.5, pitch: -.28, zoom: 1 }); const [stageMode, setStageMode] = useState<'3d' | '2d'>('3d'); const [selectionMode, setSelectionMode] = useState(false); const [selection, setSelection] = useState<number[]>([]);
-  const [message, setMessage] = useState('Beispieldaten aktiv — lade deine Pixelblaze JSON-Datei.'); const [error, setError] = useState(''); const [showExport, setShowExport] = useState(false); const [showHelp, setShowHelp] = useState(false); const [showAdjust, setShowAdjust] = useState(false); const [showRepair, setShowRepair] = useState(false);
+  const [message, setMessage] = useState('Beispieldaten aktiv — lade eine Pixelblaze-JSON- oder Marimapper-CSV-Datei.'); const [error, setError] = useState(''); const [showExport, setShowExport] = useState(false); const [showHelp, setShowHelp] = useState(false); const [showAdjust, setShowAdjust] = useState(false); const [showRepair, setShowRepair] = useState(false);
   const [repairSuggestions, setRepairSuggestions] = useState<RepairSuggestion[]>([]);
   const [repairSensitivity, setRepairSensitivity] = useState<RepairSensitivity>('conservative'); const [repairZoom, setRepairZoom] = useState(1);
   const [settings, setSettings] = useState<ExportSettings>({ universe: 0, channel: 1, channels: 3, ledSize: 6, definition: 'Generic - Pixel RGB' });
@@ -474,11 +502,15 @@ export default function Home() {
   const loadFile = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0]; if (!file) return;
     try {
-      const coords = extractCoordinates(JSON.parse(await file.text()));
+      const text = await file.text();
+      const isCsv = file.name.toLowerCase().endsWith('.csv') || /^\s*index\s*,/i.test(text);
+      const parsed: ParsedMap = isCsv ? parseMarimapperCsv(text) : { coords: extractCoordinates(JSON.parse(text)), missingIndices: new Set<number>(), sourceLabel: 'Pixelblaze JSON', measuredCount: 0 };
+      const coords = parsed.coords;
       if (coords.length > 20000) throw new Error('Für die interaktive Vorschau sind maximal 20.000 LEDs vorgesehen.');
-      const result = analyze(coords); if (!result.panels.length) throw new Error('Keine zusammenhängenden LED-Bereiche erkannt. Nutze eine sauber gescannte Map oder wähle Punkte manuell.');
+      const result = analyze(coords, parsed.missingIndices); if (!result.panels.length) throw new Error('Keine zusammenhängenden LED-Bereiche erkannt. Nutze eine sauber gescannte Map oder wähle Punkte manuell.');
       setPoints(result.points); setPanels(result.panels); setActiveId(result.panels[0].id); setPitch(result.pitch); setFileName(file.name); setSelection([]); setRepairSuggestions([]); setRepairZoom(1); setShowRepair(false); setShowAdjust(false); setStageMode('3d'); setError('');
-      setMessage(`${fmt.format(coords.length)} Slots geladen · ${result.panels.length} Panels automatisch erkannt.`);
+      const gapInfo = parsed.missingIndices.size ? ` · ${parsed.missingIndices.size} fehlende Indizes als Platzhalter` : '';
+      setMessage(`${parsed.sourceLabel}: ${fmt.format(coords.length)} Slots geladen · ${result.panels.length} Panels erkannt${gapInfo}.`);
     } catch (cause) { setError(cause instanceof Error ? cause.message : 'Die Datei konnte nicht gelesen werden.'); }
     event.target.value = '';
   };
@@ -540,9 +572,9 @@ export default function Home() {
 
   return (
     <main className="app-shell">
-      <input ref={inputRef} type="file" accept=".json,application/json" hidden onChange={loadFile} />
+      <input ref={inputRef} type="file" accept=".json,.csv,application/json,text/csv" hidden onChange={loadFile} />
       <header className="topbar">
-        <div className="brand-mark">PX</div><div className="brand-copy"><strong>Pixel Fixture Studio</strong><span>Pixelblaze → MadMapper 6.1</span></div>
+        <div className="brand-mark">PX</div><div className="brand-copy"><strong>Pixel Fixture Studio</strong><span>Pixelblaze · Marimapper → MadMapper 6.1</span></div>
         <div className="top-actions"><span className="status-dot" /><span className="status-label">Lokal im Browser</span><button className="ghost-button" onClick={() => setShowHelp(true)}>Format-Hilfe</button></div>
       </header>
 
@@ -550,7 +582,7 @@ export default function Home() {
         <aside className="rail left-rail">
           <div className="eyebrow">WORKFLOW</div>
           <ol className="steps"><li className="done"><span>✓</span><div><strong>Mapping laden</strong><small>{fmt.format(points.length)} Koordinaten</small></div></li><li className={selectionMode ? 'active' : ''}><span>2</span><div><strong>Bereich wählen</strong><small>Rahmen oder Panel</small></div></li><li className={showAdjust || showRepair ? 'active' : ''}><span>3</span><div><strong>Prüfen & ausrichten</strong><small>Repair · Rotation · Größe</small></div></li><li className={showExport ? 'active' : ''}><span>4</span><div><strong>Exportieren</strong><small>SVG · CSV · MMFL</small></div></li></ol>
-          <button className="load-button" onClick={() => inputRef.current?.click()}>＋ Pixelblaze Map laden</button>
+          <button className="load-button" onClick={() => inputRef.current?.click()}>＋ JSON / CSV Map laden</button>
           <div className="tool-group"><button className={selectionMode ? 'tool active' : 'tool'} onClick={() => setSelectionMode(v => !v)}>▧ Rahmenauswahl</button><button className="tool" disabled={!selection.length} onClick={addSelection}>＋ Auswahl als Panel</button></div>
           <div className="tool-group"><button className="tool" disabled={!active} onClick={() => setShowAdjust(true)}>↻ Aktives Panel ausrichten</button><button className="tool repair-tool" disabled={!active} onClick={openRepairReview}>◇ Messfehler prüfen</button></div>
           <div className="data-card"><span>Erkannter LED-Abstand</span><strong>{pitch.toFixed(3)}</strong><small>Cluster-Radius: {(pitch * 3).toFixed(3)}</small></div>
@@ -577,7 +609,7 @@ export default function Home() {
       {showAdjust && active && <div className="modal-backdrop" onMouseDown={() => setShowAdjust(false)}><section className="modal adjust-modal" onMouseDown={event => event.stopPropagation()} aria-modal="true" role="dialog" aria-labelledby="adjust-title"><button className="modal-close" onClick={() => setShowAdjust(false)}>×</button><span className="eyebrow">2D-AUSRICHTUNG</span><h2 id="adjust-title">{active.name} justieren</h2><p className="modal-lead">Ziehe das Panel frei um seinen Mittelpunkt. Mit dem Mausrad veränderst du seine Exportgröße.</p><div className="adjust-layout"><div className="adjust-preview"><FixturePreview panel={active} points={points} ledSize={settings.ledSize} interactive onTransform={updatePanelTransform} /><div className="adjust-hint">Ziehen: drehen · Mausrad: skalieren</div></div><div className="adjust-controls"><div className="control-block"><div className="control-title"><span>Rotation</span><output>{active.transform.rotation.toFixed(1)}°</output></div><input type="range" min="-180" max="180" step="0.1" value={active.transform.rotation} onChange={event => updatePanelTransform({ ...active.transform, rotation: Number(event.target.value) })} /><div className="snap-buttons"><button onClick={() => snapActive('horizontal')}>↔ Horizontal</button><button onClick={() => snapActive('vertical')}>↕ Vertikal</button></div></div><div className="control-block"><div className="control-title"><span>Spiegeln</span><output>{active.transform.flipX || active.transform.flipY ? [active.transform.flipX && 'H', active.transform.flipY && 'V'].filter(Boolean).join(' + ') : 'Aus'}</output></div><div className="snap-buttons flip-buttons"><button className={active.transform.flipX ? 'active' : ''} onClick={() => flipActive('horizontal')}>⇋ Horizontal flippen</button><button className={active.transform.flipY ? 'active' : ''} onClick={() => flipActive('vertical')}>⇵ Vertikal flippen</button></div></div><div className="control-block"><div className="control-title"><span>Exportgröße</span><output>{Math.round(active.transform.scale * 100)} %</output></div><div className="scale-control"><button aria-label="Verkleinern" onClick={() => updatePanelTransform({ ...active.transform, scale: active.transform.scale - .05 })}>−</button><input type="range" min="0.25" max="4" step="0.01" value={active.transform.scale} onChange={event => updatePanelTransform({ ...active.transform, scale: Number(event.target.value) })} /><button aria-label="Vergrößern" onClick={() => updatePanelTransform({ ...active.transform, scale: active.transform.scale + .05 })}>＋</button></div><small>Wirkt auf Vorschau und Exportabstände.</small></div><button className="reset-button" onClick={() => updatePanelTransform({ rotation: 0, scale: 1, flipX: false, flipY: false })}>Ausrichtung zurücksetzen</button></div></div><div className="modal-actions"><button className="secondary-button" onClick={() => setShowAdjust(false)}>Schließen</button><button className="primary-button" onClick={() => { setShowAdjust(false); setMessage(`${active.name}: ${active.transform.rotation.toFixed(1)}° · ${Math.round(active.transform.scale * 100)} %${active.transform.flipX ? ' · Flip H' : ''}${active.transform.flipY ? ' · Flip V' : ''}.`); }}>Ausrichtung übernehmen</button></div></section></div>}
       {showRepair && active && <div className="modal-backdrop" onMouseDown={() => setShowRepair(false)}><section className="modal repair-modal" onMouseDown={event => event.stopPropagation()} aria-modal="true" role="dialog" aria-labelledby="repair-title"><button className="modal-close" onClick={() => setShowRepair(false)}>×</button><span className="eyebrow">AUTO-REPAIR · VORSCHAU</span><h2 id="repair-title">Messfehler kontrollieren</h2><p className="modal-lead">Orange markiert die bisherige Messung, Grün die vorgeschlagene Position. Erst „Ausgewählte anwenden“ verändert deine Map.</p><div className="repair-toolbar"><label>Prüfstufe<select value={repairSensitivity} onChange={event => changeRepairSensitivity(event.target.value as RepairSensitivity)}><option value="conservative">Konservativ · empfohlen</option><option value="balanced">Ausgewogen</option><option value="sensitive">Empfindlich</option></select></label><div className="repair-zoom"><button aria-label="Verkleinern" onClick={() => setRepairZoom(value => Math.max(1, value - .5))}>−</button><input aria-label="Zoom der Reparaturvorschau" type="range" min="1" max="8" step="0.1" value={repairZoom} onChange={event => setRepairZoom(Number(event.target.value))} /><output>{Math.round(repairZoom * 100)} %</output><button aria-label="Vergrößern" onClick={() => setRepairZoom(value => Math.min(8, value + .5))}>＋</button></div></div><RepairPreview key={active.id} panel={active} points={points} suggestions={repairSuggestions} zoom={repairZoom} onZoomChange={setRepairZoom} /><div className="repair-pan-hint">Ziehen: Ausschnitt verschieben · Mausrad: zoomen · Doppelklick: zentrieren</div><div className="repair-legend"><span><i className="original" /> Original</span><span><i className="proposed" /> Vorschlag</span><span>{selectedRepairCount}/{repairSuggestions.length} ausgewählt</span></div><div className="repair-list">{repairSuggestions.length ? repairSuggestions.map(suggestion => <label className={`repair-row ${suggestion.selected ? 'selected' : ''}`} key={suggestion.id}><input type="checkbox" checked={suggestion.selected} onChange={() => setRepairSuggestions(items => items.map(item => item.id === suggestion.id ? { ...item, selected: !item.selected } : item))} /><span className="repair-index">#{suggestion.sourceIndex + 1}</span><span className="repair-copy"><strong>{suggestion.reason}</strong><small>{suggestion.before.map(value => value.toFixed(2)).join(' / ')} → {suggestion.after.map(value => value.toFixed(2)).join(' / ')}</small></span><span className={`confidence ${suggestion.confidence}`}>{suggestion.confidence}</span></label>) : <div className="repair-empty">Mit dieser Prüfstufe wurden keine eindeutigen Messfehler gefunden.</div>}</div><div className="repair-note">„Konservativ“ berücksichtigt nur klar eingerahmte Lücken und starke Abweichungen mit ausreichender Sicherheit. Für Grenzfälle kannst du gezielt auf „Ausgewogen“ wechseln.</div><div className="modal-actions"><button className="secondary-button" onClick={() => { setShowRepair(false); setRepairSuggestions([]); setMessage('Reparaturvorschläge verworfen — Originaldaten unverändert.'); }}>Abbrechen</button><button className="primary-button repair-apply" disabled={!selectedRepairCount} onClick={applyRepairs}>{selectedRepairCount} ausgewählte anwenden</button></div></section></div>}
       {showExport && <div className="modal-backdrop" onMouseDown={() => setShowExport(false)}><section className="modal" onMouseDown={e => e.stopPropagation()} aria-modal="true" role="dialog"><button className="modal-close" onClick={() => setShowExport(false)}>×</button><span className="eyebrow">EXPORT</span><h2>MadMapper Fixture erstellen</h2><p className="modal-lead">{enabledPanels.length} Panel{enabledPanels.length === 1 ? '' : 's'} · {fmt.format(enabledPanels.reduce((sum, panel) => sum + panel.indices.length, 0))} LEDs · in Originalreihenfolge</p><div className="form-grid"><label>Fixture Definition<input value={settings.definition} onChange={e => setSettings(s => ({ ...s, definition: e.target.value }))} /></label><label>Kanäle pro Pixel<select value={settings.channels} onChange={e => setSettings(s => ({ ...s, channels: Number(e.target.value), definition: Number(e.target.value) === 4 ? 'Generic - Pixel RGBW' : 'Generic - Pixel RGB' }))}><option value={3}>RGB · 3</option><option value={4}>RGBW · 4</option></select></label><label>Start Universe<input type="number" min="0" max="32767" value={settings.universe} onChange={e => setSettings(s => ({ ...s, universe: Math.max(0, Number(e.target.value)) }))} /></label><label>Start Channel<input type="number" min="1" max="512" value={settings.channel} onChange={e => setSettings(s => ({ ...s, channel: Math.max(1, Math.min(512, Number(e.target.value))) }))} /></label><label>Pixelgröße in MadMapper<input type="number" min="1" max="64" value={settings.ledSize} onChange={e => setSettings(s => ({ ...s, ledSize: Math.max(1, Number(e.target.value)) }))} /></label></div><div className="format-cards"><button onClick={() => exportFile('svg')}><b>SVG 6.1</b><span>Empfohlen</span><small>Exakte freie 2D-Positionen, Gruppen und DMX-Patch.</small></button><button onClick={() => exportFile('csv')}><b>CSV</b><span>Alternative</span><small>Einzelpixel mit Position, Definition und Patch.</small></button><button onClick={() => exportFile('mmfl')}><b>MMFL</b><span>Experimentell</span><small>Fixture-Editor-Definition auf quantisiertem Raster.</small></button></div><div className="format-note"><strong>Warum 2D?</strong> MadMapper importiert keine echten XYZ-Fixture-Koordinaten. Die App projiziert jedes gewählte Panel verlustarm auf seine lokale Ebene; die 3D-Map bleibt unverändert.</div></section></div>}
-      {showHelp && <div className="modal-backdrop" onMouseDown={() => setShowHelp(false)}><section className="modal help-modal" onMouseDown={e => e.stopPropagation()}><button className="modal-close" onClick={() => setShowHelp(false)}>×</button><span className="eyebrow">FORMAT-HILFE</span><h2>Welches Format wofür?</h2><div className="help-row"><b>SVG 6.1</b><p>Für File → Import Fixtures. Jede LED wird als eigenes Fixture mit aktuellen <code>universe</code>-, <code>channel</code>- und <code>fixture_definition</code>-Attributen angelegt.</p></div><div className="help-row"><b>CSV</b><p>Robuste Tabellenalternative für Fixture-Instanzen. Semikolon-getrennt und mit Gruppenpfaden pro Panel.</p></div><div className="help-row"><b>MMFL</b><p>Für den Import im Fixture Editor. Das Format beschreibt nur ein 2D-Pixelraster und Kanalbelegung; seine internen Details sind nicht vollständig öffentlich dokumentiert.</p></div><div className="help-warning">Alte MadMapper-5-SVG-Attribute werden bewusst nicht verwendet. Der Export folgt der aktuellen 6.1-Dokumentation.</div></section></div>}
+      {showHelp && <div className="modal-backdrop" onMouseDown={() => setShowHelp(false)}><section className="modal help-modal" onMouseDown={e => e.stopPropagation()}><button className="modal-close" onClick={() => setShowHelp(false)}>×</button><span className="eyebrow">FORMAT-HILFE</span><h2>Welches Format wofür?</h2><div className="help-row"><b>Import</b><p>Pixelblaze-JSON sowie Marimapper-3D-CSV (<code>index,x,y,z,xn,yn,zn,error</code>) und 2D-CSV (<code>index,u,v</code>). Fehlende Marimapper-Indizes bleiben als reparierbare Slots erhalten.</p></div><div className="help-row"><b>SVG 6.1</b><p>Für File → Import Fixtures. Jede LED wird als eigenes Fixture mit aktuellen <code>universe</code>-, <code>channel</code>- und <code>fixture_definition</code>-Attributen angelegt.</p></div><div className="help-row"><b>CSV</b><p>Robuste Tabellenalternative für Fixture-Instanzen. Semikolon-getrennt und mit Gruppenpfaden pro Panel.</p></div><div className="help-row"><b>MMFL</b><p>Für den Import im Fixture Editor. Das Format beschreibt nur ein 2D-Pixelraster und Kanalbelegung; seine internen Details sind nicht vollständig öffentlich dokumentiert.</p></div><div className="help-warning">Alte MadMapper-5-SVG-Attribute werden bewusst nicht verwendet. Der Export folgt der aktuellen 6.1-Dokumentation.</div></section></div>}
     </main>
   );
 }
