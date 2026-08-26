@@ -502,10 +502,9 @@ export default function Home() {
     if (!active) return;
     const suggestions = findRepairSuggestions(active, points, pitch, repairSensitivity);
     setRepairSuggestions(suggestions);
-    if (!suggestions.length) { setMessage(`${active.name}: keine plausiblen Index-Lücken oder Positionsausreißer gefunden.`); return; }
     setRepairZoom(1);
     setShowRepair(true);
-    setMessage(`${suggestions.length} mögliche Messfehler in ${active.name} gefunden — noch nichts verändert.`);
+    setMessage(suggestions.length ? `${suggestions.length} mögliche Messfehler in ${active.name} gefunden — noch nichts verändert.` : `${active.name}: konservative Prüfung ohne eindeutige Treffer. Im Fenster kannst du die Prüfstufe erhöhen.`);
   };
   const changeRepairSensitivity = (next: RepairSensitivity) => {
     setRepairSensitivity(next);
