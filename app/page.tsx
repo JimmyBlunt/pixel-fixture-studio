@@ -4,9 +4,20 @@ import { ChangeEvent, PointerEvent as ReactPointerEvent, useEffect, useMemo, use
 
 type Vec3 = [number, number, number];
 type MapPoint = { sourceIndex: number; xyz: Vec3; status: 'ok' | 'placeholder' | 'outlier' };
-type Panel = { id: string; name: string; indices: number[]; color: string; enabled: boolean };
+type PanelTransform = { rotation: number; scale: number };
+type Panel = { id: string; name: string; indices: number[]; color: string; enabled: boolean; transform: PanelTransform };
 type Camera = { yaw: number; pitch: number; zoom: number };
 type Projection = { sourceIndex: number; u: number; v: number };
+type PanelBasis = { center: Vec3; e1: Vec3; e2: Vec3 };
+type RepairSuggestion = {
+  id: string;
+  sourceIndex: number;
+  before: Vec3;
+  after: Vec3;
+  reason: 'Fehlender Messwert' | 'Index-Lücke' | 'Positionsausreißer' | 'Lokaler Ausreißer';
+  confidence: 'hoch' | 'mittel' | 'niedrig';
+  selected: boolean;
+};
 
 const COLORS = ['#ff4f87', '#8c7cff', '#37d9c5', '#ffae4f', '#4fa8ff', '#d875ff'];
 const fmt = new Intl.NumberFormat('de-DE');
@@ -77,7 +88,7 @@ function analyze(coords: Vec3[]) {
     sourceIndex, xyz,
     status: originCount > 1 && xyz[0] === 0 && xyz[1] === 0 && xyz[2] === 0 ? 'placeholder' : clustered.has(sourceIndex) ? 'ok' : 'outlier',
   }));
-  const panels: Panel[] = clusters.map((indices, i) => ({ id: `panel-${Date.now()}-${i}`, name: `Panel ${String(i + 1).padStart(2, '0')}`, indices: indices.sort((a, b) => a - b), color: COLORS[i % COLORS.length], enabled: true }));
+  const panels: Panel[] = clusters.map((indices, i) => ({ id: `panel-${Date.now()}-${i}`, name: `Panel ${String(i + 1).padStart(2, '0')}`, indices: indices.sort((a, b) => a - b), color: COLORS[i % COLORS.length], enabled: true, transform: { rotation: 0, scale: 1 } }));
   return { points, panels, pitch, originCount, outliers: points.filter(p => p.status === 'outlier').length };
 }
 
@@ -86,9 +97,9 @@ function norm(v: Vec3): Vec3 { const n = Math.hypot(...v) || 1; return [v[0] / n
 function mul(m: number[][], v: Vec3): Vec3 { return [dot(m[0] as Vec3, v), dot(m[1] as Vec3, v), dot(m[2] as Vec3, v)]; }
 function power(m: number[][], seed: Vec3): Vec3 { let v = norm(seed); for (let i = 0; i < 24; i++) v = norm(mul(m, v)); return v; }
 
-function projectPanel(panel: Panel, points: MapPoint[]): Projection[] {
+function getPanelBasis(panel: Panel, points: MapPoint[]): PanelBasis | null {
   const pts = panel.indices.map(index => points[index]).filter(Boolean);
-  if (!pts.length) return [];
+  if (!pts.length) return null;
   const c: Vec3 = [0, 0, 0];
   pts.forEach(p => p.xyz.forEach((n, i) => { c[i] += n / pts.length; }));
   const cov = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
@@ -101,7 +112,96 @@ function projectPanel(panel: Panel, points: MapPoint[]): Projection[] {
   const travel: Vec3 = [last[0] - first[0], last[1] - first[1], last[2] - first[2]];
   if (dot(e1, travel) < 0) e1 = [-e1[0], -e1[1], -e1[2]];
   if (Math.abs(dot(e1, e2)) > .15) e2 = norm([e2[0] - dot(e1, e2) * e1[0], e2[1] - dot(e1, e2) * e1[1], e2[2] - dot(e1, e2) * e1[2]]);
-  return pts.map(p => { const d: Vec3 = [p.xyz[0] - c[0], p.xyz[1] - c[1], p.xyz[2] - c[2]]; return { sourceIndex: p.sourceIndex, u: dot(d, e1), v: -dot(d, e2) }; });
+  return { center: c, e1, e2 };
+}
+
+function projectXyz(xyz: Vec3, basis: PanelBasis) {
+  const d: Vec3 = [xyz[0] - basis.center[0], xyz[1] - basis.center[1], xyz[2] - basis.center[2]];
+  return { u: dot(d, basis.e1), v: -dot(d, basis.e2) };
+}
+
+function projectPanel(panel: Panel, points: MapPoint[]): Projection[] {
+  const basis = getPanelBasis(panel, points);
+  if (!basis) return [];
+  return panel.indices.map(index => points[index]).filter(Boolean).map(point => ({ sourceIndex: point.sourceIndex, ...projectXyz(point.xyz, basis) }));
+}
+
+function transformProjection(projected: Projection[], transform: PanelTransform, includeScale = true) {
+  const angle = transform.rotation * Math.PI / 180;
+  const c = Math.cos(angle), s = Math.sin(angle), scale = includeScale ? transform.scale : 1;
+  return projected.map(point => ({ ...point, u: (point.u * c - point.v * s) * scale, v: (point.u * s + point.v * c) * scale }));
+}
+
+function adjustedPanelProjection(panel: Panel, points: MapPoint[]) {
+  return transformProjection(projectPanel(panel, points), panel.transform);
+}
+
+function add(a: Vec3, b: Vec3): Vec3 { return [a[0] + b[0], a[1] + b[1], a[2] + b[2]]; }
+function sub(a: Vec3, b: Vec3): Vec3 { return [a[0] - b[0], a[1] - b[1], a[2] - b[2]]; }
+function scaleVec(v: Vec3, factor: number): Vec3 { return [v[0] * factor, v[1] * factor, v[2] * factor]; }
+function averageVec(values: Vec3[]): Vec3 {
+  return values.reduce<Vec3>((sum, value) => add(sum, value), [0, 0, 0]).map(value => value / Math.max(values.length, 1)) as Vec3;
+}
+
+function estimatePosition(sourceIndex: number, valid: MapPoint[], pitch: number) {
+  const before = valid.filter(point => point.sourceIndex < sourceIndex).sort((a, b) => b.sourceIndex - a.sourceIndex);
+  const after = valid.filter(point => point.sourceIndex > sourceIndex).sort((a, b) => a.sourceIndex - b.sourceIndex);
+  const candidates: Vec3[] = [];
+
+  if (before[0] && after[0]) {
+    const span = after[0].sourceIndex - before[0].sourceIndex;
+    const t = (sourceIndex - before[0].sourceIndex) / Math.max(span, 1);
+    candidates.push(add(before[0].xyz, scaleVec(sub(after[0].xyz, before[0].xyz), t)));
+  }
+  if (before[0] && before[1]) {
+    const step = scaleVec(sub(before[0].xyz, before[1].xyz), 1 / Math.max(before[0].sourceIndex - before[1].sourceIndex, 1));
+    candidates.push(add(before[0].xyz, scaleVec(step, sourceIndex - before[0].sourceIndex)));
+  }
+  if (after[0] && after[1]) {
+    const step = scaleVec(sub(after[1].xyz, after[0].xyz), 1 / Math.max(after[1].sourceIndex - after[0].sourceIndex, 1));
+    candidates.push(sub(after[0].xyz, scaleVec(step, after[0].sourceIndex - sourceIndex)));
+  }
+  if (!candidates.length) return null;
+
+  const position = averageVec(candidates);
+  const disagreement = Math.max(...candidates.map(candidate => dist(candidate, position)), 0);
+  const support = Math.min(before.length, 2) + Math.min(after.length, 2);
+  const confidence: RepairSuggestion['confidence'] = support >= 4 && disagreement <= pitch * .7 ? 'hoch' : support >= 2 && disagreement <= pitch * 1.6 ? 'mittel' : 'niedrig';
+  return { position, confidence };
+}
+
+function findRepairSuggestions(panel: Panel, points: MapPoint[], pitch: number): RepairSuggestion[] {
+  if (!panel.indices.length) return [];
+  const sortedPanel = [...panel.indices].sort((a, b) => a - b);
+  const minIndex = sortedPanel[0], maxIndex = sortedPanel[sortedPanel.length - 1];
+  const panelSet = new Set(sortedPanel);
+  const suspectReasons = new Map<number, RepairSuggestion['reason']>();
+
+  for (let index = minIndex; index <= maxIndex; index++) {
+    const point = points[index];
+    if (!point) continue;
+    if (point.status === 'placeholder') suspectReasons.set(index, 'Fehlender Messwert');
+    else if (point.status === 'outlier') suspectReasons.set(index, 'Positionsausreißer');
+    else if (!panelSet.has(index)) suspectReasons.set(index, 'Index-Lücke');
+  }
+
+  sortedPanel.forEach((index, rank) => {
+    if (rank === 0 || rank === sortedPanel.length - 1 || suspectReasons.has(index)) return;
+    const current = points[index], previous = points[sortedPanel[rank - 1]], next = points[sortedPanel[rank + 1]];
+    if (!current || !previous || !next || previous.status !== 'ok' || next.status !== 'ok') return;
+    const midpoint = averageVec([previous.xyz, next.xyz]);
+    const neighborSpan = dist(previous.xyz, next.xyz);
+    if (neighborSpan <= pitch * 3.2 && dist(current.xyz, midpoint) > pitch * 1.8) suspectReasons.set(index, 'Lokaler Ausreißer');
+  });
+
+  const suspects = new Set(suspectReasons.keys());
+  const valid = points.filter(point => point.sourceIndex >= minIndex && point.sourceIndex <= maxIndex && panelSet.has(point.sourceIndex) && point.status === 'ok' && !suspects.has(point.sourceIndex));
+  return [...suspectReasons.entries()].sort((a, b) => a[0] - b[0]).flatMap(([sourceIndex, reason]) => {
+    const estimate = estimatePosition(sourceIndex, valid, pitch);
+    const point = points[sourceIndex];
+    if (!estimate || !point) return [];
+    return [{ id: `repair-${sourceIndex}`, sourceIndex, before: point.xyz, after: estimate.position, reason, confidence: estimate.confidence, selected: estimate.confidence !== 'niedrig' }];
+  });
 }
 
 function xmlEscape(value: string) { return value.replace(/[<>&"']/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;', "'": '&apos;' }[c] ?? c)); }
@@ -112,11 +212,12 @@ function layoutPanels(panels: Panel[], points: MapPoint[], ledSize: number) {
   let maxHeight = 100;
   const laid: { panel: Panel; pixels: (Projection & { x: number; y: number })[] }[] = [];
   panels.forEach(panel => {
-    const projected = projectPanel(panel, points);
+    const baseProjected = projectPanel(panel, points);
+    const projected = transformProjection(baseProjected, panel.transform, false);
     const uMin = Math.min(...projected.map(p => p.u)), uMax = Math.max(...projected.map(p => p.u));
     const vMin = Math.min(...projected.map(p => p.v)), vMax = Math.max(...projected.map(p => p.v));
-    const nearest2d = projected.map((p, i) => Math.min(...projected.filter((_, j) => i !== j).map(q => Math.hypot(p.u - q.u, p.v - q.v)))).filter(Number.isFinite);
-    const scale = 14 / Math.max(median(nearest2d), .001);
+    const nearest2d = baseProjected.map((p, i) => Math.min(...baseProjected.filter((_, j) => i !== j).map(q => Math.hypot(p.u - q.u, p.v - q.v)))).filter(Number.isFinite);
+    const scale = 14 / Math.max(median(nearest2d), .001) * panel.transform.scale;
     const pixels = projected.map(p => ({ ...p, x: offsetX + (p.u - uMin) * scale, y: ledSize * 2 + (p.v - vMin) * scale }));
     const width = Math.max((uMax - uMin) * scale + ledSize * 4, ledSize * 6);
     maxHeight = Math.max(maxHeight, (vMax - vMin) * scale + ledSize * 4);
@@ -160,8 +261,9 @@ function buildCsv(panels: Panel[], points: MapPoint[], settings: ExportSettings)
 
 function buildMmfl(panels: Panel[], points: MapPoint[], settings: ExportSettings) {
   const fixtures = panels.map(panel => {
-    const projected = projectPanel(panel, points);
-    const nearest2d = projected.map((p, i) => Math.min(...projected.filter((_, j) => i !== j).map(q => Math.hypot(p.u - q.u, p.v - q.v)))).filter(Number.isFinite);
+    const baseProjected = projectPanel(panel, points);
+    const projected = transformProjection(baseProjected, panel.transform);
+    const nearest2d = baseProjected.map((p, i) => Math.min(...baseProjected.filter((_, j) => i !== j).map(q => Math.hypot(p.u - q.u, p.v - q.v)))).filter(Number.isFinite);
     const pitch = Math.max(median(nearest2d), .001);
     const uMin = Math.min(...projected.map(p => p.u)), vMin = Math.min(...projected.map(p => p.v));
     const cells = projected.map((p, rank) => ({ x: Math.round((p.u - uMin) / pitch), y: Math.round((p.v - vMin) / pitch), value: 1 + rank * settings.channels }));
@@ -194,7 +296,6 @@ function MapCanvas({ points, panels, selectionMode, onSelection, view }: { point
     else if (view === 'Front') camera.current = { yaw: 0, pitch: 0, zoom: camera.current.zoom };
     else if (view === 'Side') camera.current = { yaw: -Math.PI / 2, pitch: 0, zoom: camera.current.zoom };
     else camera.current = { yaw: -.5, pitch: -.28, zoom: camera.current.zoom };
-    setRevision(r => r + 1);
   }, [view]);
 
   useEffect(() => {
@@ -227,7 +328,7 @@ function MapCanvas({ points, panels, selectionMode, onSelection, view }: { point
       if (box) { ctx.fillStyle = 'rgba(255,79,135,.12)'; ctx.strokeStyle = '#ff4f87'; ctx.setLineDash([5, 4]); ctx.fillRect(box.x1, box.y1, box.x2 - box.x1, box.y2 - box.y1); ctx.strokeRect(box.x1, box.y1, box.x2 - box.x1, box.y2 - box.y1); ctx.setLineDash([]); }
     };
     render(); const observer = new ResizeObserver(render); observer.observe(canvas); return () => observer.disconnect();
-  }, [points, panels, box, revision]);
+  }, [points, panels, box, revision, view]);
 
   const pointerDown = (event: ReactPointerEvent<HTMLCanvasElement>) => {
     event.currentTarget.setPointerCapture(event.pointerId);
@@ -254,18 +355,95 @@ function MapCanvas({ points, panels, selectionMode, onSelection, view }: { point
   return <canvas ref={ref} className={`map-canvas ${selectionMode ? 'selecting' : ''}`} onPointerDown={pointerDown} onPointerMove={pointerMove} onPointerUp={pointerUp} onPointerCancel={pointerUp} onWheel={wheel} aria-label="Interaktive 3D-Vorschau der LED-Koordinaten" />;
 }
 
-function FixturePreview({ panel, points, ledSize }: { panel?: Panel; points: MapPoint[]; ledSize: number }) {
+function normalizeDegrees(value: number) {
+  let normalized = value % 360;
+  if (normalized > 180) normalized -= 360;
+  if (normalized <= -180) normalized += 360;
+  return Math.round(normalized * 10) / 10;
+}
+
+function FixturePreview({ panel, points, ledSize, interactive = false, onTransform }: { panel?: Panel; points: MapPoint[]; ledSize: number; interactive?: boolean; onTransform?: (transform: PanelTransform) => void }) {
+  const ref = useRef<HTMLCanvasElement>(null);
+  const drag = useRef<{ angle: number; rotation: number } | null>(null);
+  useEffect(() => {
+    const canvas = ref.current, baseProjected = panel ? projectPanel(panel, points) : [], projected = panel ? adjustedPanelProjection(panel, points) : []; if (!canvas) return;
+    const ctx = canvas.getContext('2d'); if (!ctx) return;
+    const render = () => {
+      const rect = canvas.getBoundingClientRect(), ratio = window.devicePixelRatio || 1; canvas.width = rect.width * ratio; canvas.height = rect.height * ratio; ctx.setTransform(ratio, 0, 0, ratio, 0, 0); ctx.clearRect(0, 0, rect.width, rect.height);
+      const centerX = rect.width / 2, centerY = rect.height / 2;
+      ctx.strokeStyle = 'rgba(137,151,178,.1)'; ctx.lineWidth = 1;
+      for (let x = centerX % 28; x < rect.width; x += 28) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, rect.height); ctx.stroke(); }
+      for (let y = centerY % 28; y < rect.height; y += 28) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(rect.width, y); ctx.stroke(); }
+      ctx.strokeStyle = 'rgba(255,255,255,.2)'; ctx.beginPath(); ctx.moveTo(0, centerY); ctx.lineTo(rect.width, centerY); ctx.moveTo(centerX, 0); ctx.lineTo(centerX, rect.height); ctx.stroke();
+      if (!projected.length || !baseProjected.length) return;
+      const span = Math.max(...baseProjected.flatMap(point => [Math.abs(point.u), Math.abs(point.v)]), .001);
+      const scale = Math.min(rect.width, rect.height) * .4 / span;
+      projected.forEach((point, index) => {
+        const x = centerX + point.u * scale, y = centerY + point.v * scale;
+        ctx.fillStyle = panel?.color ?? '#ff4f87'; ctx.shadowColor = panel?.color ?? '#ff4f87'; ctx.shadowBlur = interactive ? 7 : 4; ctx.globalAlpha = .62 + .38 * index / projected.length;
+        const size = Math.max(2.4, Math.min(7, ledSize / (interactive ? 1.5 : 2.5)));
+        ctx.fillRect(x - size / 2, y - size / 2, size, size);
+      });
+      ctx.globalAlpha = 1; ctx.shadowBlur = 0;
+    };
+    render(); const observer = new ResizeObserver(render); observer.observe(canvas); return () => observer.disconnect();
+  }, [panel, points, ledSize, interactive]);
+
+  const pointerAngle = (event: ReactPointerEvent<HTMLCanvasElement>) => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    return Math.atan2(event.clientY - rect.top - rect.height / 2, event.clientX - rect.left - rect.width / 2);
+  };
+  const pointerDown = (event: ReactPointerEvent<HTMLCanvasElement>) => {
+    if (!interactive || !panel || !onTransform) return;
+    event.currentTarget.setPointerCapture(event.pointerId);
+    drag.current = { angle: pointerAngle(event), rotation: panel.transform.rotation };
+  };
+  const pointerMove = (event: ReactPointerEvent<HTMLCanvasElement>) => {
+    if (!drag.current || !panel || !onTransform) return;
+    const delta = (pointerAngle(event) - drag.current.angle) * 180 / Math.PI;
+    onTransform({ ...panel.transform, rotation: normalizeDegrees(drag.current.rotation + delta) });
+  };
+  const pointerUp = () => { drag.current = null; };
+  const wheel = (event: React.WheelEvent<HTMLCanvasElement>) => {
+    if (!interactive || !panel || !onTransform) return;
+    event.preventDefault();
+    onTransform({ ...panel.transform, scale: Math.max(.25, Math.min(4, panel.transform.scale * Math.exp(-event.deltaY * .001))) });
+  };
+
+  return <canvas ref={ref} className={`fixture-canvas ${interactive ? 'interactive' : ''}`} onPointerDown={pointerDown} onPointerMove={pointerMove} onPointerUp={pointerUp} onPointerCancel={pointerUp} onWheel={wheel} aria-label={interactive ? 'Interaktive 2D-Ausrichtung: ziehen dreht, Mausrad skaliert' : '2D-Projektion wie in MadMapper'} />;
+}
+
+function RepairPreview({ panel, points, suggestions }: { panel?: Panel; points: MapPoint[]; suggestions: RepairSuggestion[] }) {
   const ref = useRef<HTMLCanvasElement>(null);
   useEffect(() => {
-    const canvas = ref.current, projected = panel ? projectPanel(panel, points) : []; if (!canvas) return;
-    const ctx = canvas.getContext('2d'); if (!ctx) return;
-    const rect = canvas.getBoundingClientRect(), ratio = window.devicePixelRatio || 1; canvas.width = rect.width * ratio; canvas.height = rect.height * ratio; ctx.setTransform(ratio, 0, 0, ratio, 0, 0); ctx.clearRect(0, 0, rect.width, rect.height);
-    if (!projected.length) return;
-    const uMin = Math.min(...projected.map(p => p.u)), uMax = Math.max(...projected.map(p => p.u)), vMin = Math.min(...projected.map(p => p.v)), vMax = Math.max(...projected.map(p => p.v));
-    const scale = Math.min((rect.width - 24) / Math.max(uMax - uMin, 1), (rect.height - 24) / Math.max(vMax - vMin, 1));
-    projected.forEach((p, i) => { const x = 12 + (p.u - uMin) * scale, y = 12 + (p.v - vMin) * scale; ctx.fillStyle = panel?.color ?? '#ff4f87'; ctx.globalAlpha = .6 + .4 * i / projected.length; ctx.fillRect(x - ledSize / 5, y - ledSize / 5, Math.max(2, ledSize / 2.5), Math.max(2, ledSize / 2.5)); }); ctx.globalAlpha = 1;
-  }, [panel, points, ledSize]);
-  return <canvas ref={ref} className="fixture-canvas" aria-label="2D-Projektion wie in MadMapper" />;
+    const canvas = ref.current; if (!canvas || !panel) return;
+    const ctx = canvas.getContext('2d'), basis = getPanelBasis(panel, points); if (!ctx || !basis) return;
+    const base = adjustedPanelProjection(panel, points);
+    const projectRepair = (xyz: Vec3, sourceIndex: number) => transformProjection([{ sourceIndex, ...projectXyz(xyz, basis) }], panel.transform)[0];
+    const proposed = suggestions.map(suggestion => ({ suggestion, before: projectRepair(suggestion.before, suggestion.sourceIndex), after: projectRepair(suggestion.after, suggestion.sourceIndex) }));
+    const render = () => {
+      const rect = canvas.getBoundingClientRect(), ratio = window.devicePixelRatio || 1; canvas.width = rect.width * ratio; canvas.height = rect.height * ratio; ctx.setTransform(ratio, 0, 0, ratio, 0, 0); ctx.clearRect(0, 0, rect.width, rect.height);
+      const fitPoints = [...base, ...proposed.map(item => item.after)];
+      const span = Math.max(...fitPoints.flatMap(point => [Math.abs(point.u), Math.abs(point.v)]), .001);
+      const scale = Math.min(rect.width, rect.height) * .4 / span, centerX = rect.width / 2, centerY = rect.height / 2;
+      const screen = (point: Projection) => ({ x: centerX + point.u * scale, y: centerY + point.v * scale });
+      ctx.strokeStyle = 'rgba(137,151,178,.11)';
+      for (let x = centerX % 30; x < rect.width; x += 30) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, rect.height); ctx.stroke(); }
+      for (let y = centerY % 30; y < rect.height; y += 30) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(rect.width, y); ctx.stroke(); }
+      base.forEach(point => { const p = screen(point); ctx.fillStyle = panel.color; ctx.globalAlpha = .42; ctx.beginPath(); ctx.arc(p.x, p.y, 3, 0, Math.PI * 2); ctx.fill(); });
+      ctx.globalAlpha = 1;
+      proposed.forEach(({ suggestion, before, after }) => {
+        const oldPoint = screen(before), newPoint = screen(after), active = suggestion.selected;
+        const oldClamped = { x: Math.max(10, Math.min(rect.width - 10, oldPoint.x)), y: Math.max(10, Math.min(rect.height - 10, oldPoint.y)) };
+        ctx.strokeStyle = active ? '#49dcb3' : '#667085'; ctx.setLineDash([5, 4]); ctx.beginPath(); ctx.moveTo(oldClamped.x, oldClamped.y); ctx.lineTo(newPoint.x, newPoint.y); ctx.stroke(); ctx.setLineDash([]);
+        ctx.strokeStyle = '#ffb454'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(oldClamped.x - 4, oldClamped.y - 4); ctx.lineTo(oldClamped.x + 4, oldClamped.y + 4); ctx.moveTo(oldClamped.x + 4, oldClamped.y - 4); ctx.lineTo(oldClamped.x - 4, oldClamped.y + 4); ctx.stroke();
+        ctx.fillStyle = active ? '#49dcb3' : '#667085'; ctx.beginPath(); ctx.arc(newPoint.x, newPoint.y, 5, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = '#dce4f2'; ctx.font = '10px Arial'; ctx.fillText(`#${suggestion.sourceIndex + 1}`, newPoint.x + 7, newPoint.y - 7);
+      });
+    };
+    render(); const observer = new ResizeObserver(render); observer.observe(canvas); return () => observer.disconnect();
+  }, [panel, points, suggestions]);
+  return <canvas ref={ref} className="repair-canvas" aria-label="Vorher-Nachher-Vorschau der vorgeschlagenen Pixelreparaturen" />;
 }
 
 export default function Home() {
@@ -273,12 +451,14 @@ export default function Home() {
   const [points, setPoints] = useState(initial.points); const [panels, setPanels] = useState(initial.panels);
   const [fileName, setFileName] = useState('Demo · 3 Panels'); const [pitch, setPitch] = useState(initial.pitch); const [activeId, setActiveId] = useState(initial.panels[0]?.id ?? '');
   const [view, setView] = useState('3D'); const [selectionMode, setSelectionMode] = useState(false); const [selection, setSelection] = useState<number[]>([]);
-  const [message, setMessage] = useState('Beispieldaten aktiv — lade deine Pixelblaze JSON-Datei.'); const [error, setError] = useState(''); const [showExport, setShowExport] = useState(false); const [showHelp, setShowHelp] = useState(false);
+  const [message, setMessage] = useState('Beispieldaten aktiv — lade deine Pixelblaze JSON-Datei.'); const [error, setError] = useState(''); const [showExport, setShowExport] = useState(false); const [showHelp, setShowHelp] = useState(false); const [showAdjust, setShowAdjust] = useState(false); const [showRepair, setShowRepair] = useState(false);
+  const [repairSuggestions, setRepairSuggestions] = useState<RepairSuggestion[]>([]);
   const [settings, setSettings] = useState<ExportSettings>({ universe: 0, channel: 1, channels: 3, ledSize: 6, definition: 'Generic - Pixel RGB' });
   const inputRef = useRef<HTMLInputElement>(null);
   const active = panels.find(p => p.id === activeId) ?? panels[0];
   const enabledPanels = panels.filter(p => p.enabled);
   const placeholders = points.filter(p => p.status === 'placeholder').length, outliers = points.filter(p => p.status === 'outlier').length;
+  const selectedRepairCount = repairSuggestions.filter(suggestion => suggestion.selected).length;
 
   const loadFile = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0]; if (!file) return;
@@ -286,7 +466,7 @@ export default function Home() {
       const coords = extractCoordinates(JSON.parse(await file.text()));
       if (coords.length > 20000) throw new Error('Für die interaktive Vorschau sind maximal 20.000 LEDs vorgesehen.');
       const result = analyze(coords); if (!result.panels.length) throw new Error('Keine zusammenhängenden LED-Bereiche erkannt. Nutze eine sauber gescannte Map oder wähle Punkte manuell.');
-      setPoints(result.points); setPanels(result.panels); setActiveId(result.panels[0].id); setPitch(result.pitch); setFileName(file.name); setSelection([]); setError('');
+      setPoints(result.points); setPanels(result.panels); setActiveId(result.panels[0].id); setPitch(result.pitch); setFileName(file.name); setSelection([]); setRepairSuggestions([]); setShowRepair(false); setShowAdjust(false); setError('');
       setMessage(`${fmt.format(coords.length)} Slots geladen · ${result.panels.length} Panels automatisch erkannt.`);
     } catch (cause) { setError(cause instanceof Error ? cause.message : 'Die Datei konnte nicht gelesen werden.'); }
     event.target.value = '';
@@ -294,8 +474,34 @@ export default function Home() {
   const togglePanel = (id: string) => setPanels(items => items.map(item => item.id === id ? { ...item, enabled: !item.enabled } : item));
   const addSelection = () => {
     if (!selection.length) { setMessage('Ziehe zuerst im Auswahlmodus einen Rahmen um LEDs.'); return; }
-    const id = `manual-${Date.now()}`; const newPanel: Panel = { id, name: `Auswahl ${panels.length + 1}`, indices: [...selection].sort((a, b) => a - b), color: COLORS[panels.length % COLORS.length], enabled: true };
+    const id = `manual-${Date.now()}`; const newPanel: Panel = { id, name: `Auswahl ${panels.length + 1}`, indices: [...selection].sort((a, b) => a - b), color: COLORS[panels.length % COLORS.length], enabled: true, transform: { rotation: 0, scale: 1 } };
     setPanels(items => [...items, newPanel]); setActiveId(id); setSelection([]); setSelectionMode(false); setMessage(`${fmt.format(newPanel.indices.length)} LEDs als neuer Bereich angelegt.`);
+  };
+  const updatePanelTransform = (transform: PanelTransform) => {
+    if (!active) return;
+    setPanels(items => items.map(item => item.id === active.id ? { ...item, transform: { rotation: normalizeDegrees(transform.rotation), scale: Math.max(.25, Math.min(4, transform.scale)) } } : item));
+  };
+  const snapActive = (axis: 'horizontal' | 'vertical') => {
+    if (!active) return;
+    const rotation = axis === 'horizontal' ? Math.round(active.transform.rotation / 180) * 180 : 90 + Math.round((active.transform.rotation - 90) / 180) * 180;
+    updatePanelTransform({ ...active.transform, rotation: normalizeDegrees(rotation) });
+  };
+  const openRepairReview = () => {
+    if (!active) return;
+    const suggestions = findRepairSuggestions(active, points, pitch);
+    setRepairSuggestions(suggestions);
+    if (!suggestions.length) { setMessage(`${active.name}: keine plausiblen Index-Lücken oder Positionsausreißer gefunden.`); return; }
+    setShowRepair(true);
+    setMessage(`${suggestions.length} mögliche Messfehler in ${active.name} gefunden — noch nichts verändert.`);
+  };
+  const applyRepairs = () => {
+    if (!active) return;
+    const accepted = repairSuggestions.filter(suggestion => suggestion.selected);
+    if (!accepted.length) return;
+    const replacements = new Map(accepted.map(suggestion => [suggestion.sourceIndex, suggestion.after]));
+    setPoints(items => items.map(point => replacements.has(point.sourceIndex) ? { ...point, xyz: replacements.get(point.sourceIndex)!, status: 'ok' } : point));
+    setPanels(items => items.map(item => item.id === active.id ? { ...item, indices: [...new Set([...item.indices, ...accepted.map(suggestion => suggestion.sourceIndex)])].sort((a, b) => a - b) } : item));
+    setShowRepair(false); setRepairSuggestions([]); setMessage(`${accepted.length} bestätigte Pixelposition${accepted.length === 1 ? '' : 'en'} repariert.`);
   };
   const exportFile = (format: 'svg' | 'csv' | 'mmfl') => {
     if (!enabledPanels.length) { setError('Aktiviere mindestens ein Panel für den Export.'); return; }
@@ -317,31 +523,34 @@ export default function Home() {
       <section className="workspace">
         <aside className="rail left-rail">
           <div className="eyebrow">WORKFLOW</div>
-          <ol className="steps"><li className="done"><span>✓</span><div><strong>Mapping laden</strong><small>{fmt.format(points.length)} Koordinaten</small></div></li><li className={selectionMode ? 'active' : ''}><span>2</span><div><strong>Bereich wählen</strong><small>Rahmen oder Panel</small></div></li><li className={showExport ? 'active' : ''}><span>3</span><div><strong>Fixture bauen</strong><small>2D-Projektion</small></div></li><li><span>4</span><div><strong>Exportieren</strong><small>SVG · CSV · MMFL</small></div></li></ol>
+          <ol className="steps"><li className="done"><span>✓</span><div><strong>Mapping laden</strong><small>{fmt.format(points.length)} Koordinaten</small></div></li><li className={selectionMode ? 'active' : ''}><span>2</span><div><strong>Bereich wählen</strong><small>Rahmen oder Panel</small></div></li><li className={showAdjust || showRepair ? 'active' : ''}><span>3</span><div><strong>Prüfen & ausrichten</strong><small>Repair · Rotation · Größe</small></div></li><li className={showExport ? 'active' : ''}><span>4</span><div><strong>Exportieren</strong><small>SVG · CSV · MMFL</small></div></li></ol>
           <button className="load-button" onClick={() => inputRef.current?.click()}>＋ Pixelblaze Map laden</button>
           <div className="tool-group"><button className={selectionMode ? 'tool active' : 'tool'} onClick={() => setSelectionMode(v => !v)}>▧ Rahmenauswahl</button><button className="tool" disabled={!selection.length} onClick={addSelection}>＋ Auswahl als Panel</button></div>
+          <div className="tool-group"><button className="tool" disabled={!active} onClick={() => setShowAdjust(true)}>↻ Aktives Panel ausrichten</button><button className="tool repair-tool" disabled={!active} onClick={openRepairReview}>◇ Messfehler prüfen</button></div>
           <div className="data-card"><span>Erkannter LED-Abstand</span><strong>{pitch.toFixed(3)}</strong><small>Cluster-Radius: {(pitch * 3).toFixed(3)}</small></div>
           <p className="privacy-note">Deine Mapping-Datei bleibt auf diesem Gerät und wird nicht hochgeladen.</p>
         </aside>
 
         <section className="stage-card">
-          <div className="stage-toolbar"><div><span className="eyebrow">3D MAP</span><h1>{fileName}</h1></div><div className="view-switch">{['3D', 'Top', 'Front', 'Side'].map(item => <button key={item} className={view === item ? 'selected' : ''} onClick={() => setView(item)}>{item}</button>)}</div></div>
+          <div className="stage-toolbar"><div><span className="eyebrow">3D MAP</span><h1>{fileName}</h1></div><div className="stage-actions"><button onClick={() => setShowAdjust(true)}>2D ausrichten</button><button onClick={openRepairReview}>Auto-Repair</button></div><div className="view-switch">{['3D', 'Top', 'Front', 'Side'].map(item => <button key={item} className={view === item ? 'selected' : ''} onClick={() => setView(item)}>{item}</button>)}</div></div>
           <div className="viewport">
             <MapCanvas points={points} panels={panels} selectionMode={selectionMode} onSelection={indices => { setSelection(indices); setMessage(`${fmt.format(indices.length)} LEDs im Rahmen markiert.`); }} view={view} />
             <div className="axis-chip"><i className="x" /> X <i className="y" /> Y <i className="z" /> Z</div><div className="canvas-help">{selectionMode ? 'Rahmen ziehen, um LEDs zu markieren' : 'Ziehen: drehen · Scrollen: zoomen · Shift: auswählen'}</div>
           </div>
-          <div className="stage-footer"><span><b>{fmt.format(points.length)}</b> Slots</span><span><b>{panels.length}</b> Bereiche</span><span className={placeholders + outliers ? 'warning' : ''}><b>{placeholders + outliers}</b> Warnungen</span><span className="status-message">{message}</span></div>
+          <div className="stage-footer"><span><b>{fmt.format(points.length)}</b> Slots</span><span><b>{panels.length}</b> Bereiche</span><button className={`warning-button ${placeholders + outliers ? 'warning' : ''}`} onClick={openRepairReview}><b>{placeholders + outliers}</b> Warnungen prüfen</button><span className="status-message">{message}</span></div>
         </section>
 
         <aside className="rail right-rail">
           <div className="panel-heading"><div><span className="eyebrow">BEREICHE</span><h2>Panels & Export</h2></div><span className="count-chip">{enabledPanels.length}/{panels.length}</span></div>
           <div className="panel-list">{panels.map(panel => <div className={`panel-row ${panel.id === active?.id ? 'chosen' : ''}`} key={panel.id}><button className="panel-main" onClick={() => setActiveId(panel.id)}><span className="color-dot" style={{ background: panel.color }} /><span><strong>{panel.name}</strong><small>{fmt.format(panel.indices.length)} LEDs · #{panel.indices[0]}–{panel.indices.at(-1)}</small></span></button><label className="switch" title="Für Export aktiv"><input type="checkbox" checked={panel.enabled} onChange={() => togglePanel(panel.id)} /><i /></label></div>)}</div>
-          <div className="fixture-preview"><div className="preview-title"><span className="eyebrow">MADMapper 2D-VORSCHAU</span><span>{active?.name ?? '—'}</span></div><FixturePreview panel={active} points={points} ledSize={settings.ledSize} /><p>Best-Fit-Ebene · Quellreihenfolge bleibt erhalten</p></div>
+          <div className="fixture-preview"><div className="preview-title"><span className="eyebrow">MADMapper 2D-VORSCHAU</span><span>{active?.name ?? '—'}</span></div><FixturePreview panel={active} points={points} ledSize={settings.ledSize} /><div className="preview-metrics"><span>{active ? `${active.transform.rotation.toFixed(1)}°` : '—'}</span><span>{active ? `${Math.round(active.transform.scale * 100)} %` : '—'}</span></div><div className="preview-actions"><button onClick={() => setShowAdjust(true)}>↻ Ausrichten</button><button onClick={openRepairReview}>◇ Auto-Repair</button></div><p>Best-Fit-Ebene · Quellreihenfolge bleibt erhalten</p></div>
           <button className="export-button" onClick={() => setShowExport(true)}>Fixture erstellen <span>→</span></button>
         </aside>
       </section>
 
       {error && <div className="toast error" role="alert"><span>!</span>{error}<button onClick={() => setError('')}>×</button></div>}
+      {showAdjust && active && <div className="modal-backdrop" onMouseDown={() => setShowAdjust(false)}><section className="modal adjust-modal" onMouseDown={event => event.stopPropagation()} aria-modal="true" role="dialog" aria-labelledby="adjust-title"><button className="modal-close" onClick={() => setShowAdjust(false)}>×</button><span className="eyebrow">2D-AUSRICHTUNG</span><h2 id="adjust-title">{active.name} justieren</h2><p className="modal-lead">Ziehe das Panel frei um seinen Mittelpunkt. Mit dem Mausrad veränderst du seine Exportgröße.</p><div className="adjust-layout"><div className="adjust-preview"><FixturePreview panel={active} points={points} ledSize={settings.ledSize} interactive onTransform={updatePanelTransform} /><div className="adjust-hint">Ziehen: drehen · Mausrad: skalieren</div></div><div className="adjust-controls"><div className="control-block"><div className="control-title"><span>Rotation</span><output>{active.transform.rotation.toFixed(1)}°</output></div><input type="range" min="-180" max="180" step="0.1" value={active.transform.rotation} onChange={event => updatePanelTransform({ ...active.transform, rotation: Number(event.target.value) })} /><div className="snap-buttons"><button onClick={() => snapActive('horizontal')}>↔ Horizontal</button><button onClick={() => snapActive('vertical')}>↕ Vertikal</button></div></div><div className="control-block"><div className="control-title"><span>Exportgröße</span><output>{Math.round(active.transform.scale * 100)} %</output></div><div className="scale-control"><button aria-label="Verkleinern" onClick={() => updatePanelTransform({ ...active.transform, scale: active.transform.scale - .05 })}>−</button><input type="range" min="0.25" max="4" step="0.01" value={active.transform.scale} onChange={event => updatePanelTransform({ ...active.transform, scale: Number(event.target.value) })} /><button aria-label="Vergrößern" onClick={() => updatePanelTransform({ ...active.transform, scale: active.transform.scale + .05 })}>＋</button></div><small>Wirkt auf Vorschau und Exportabstände.</small></div><button className="reset-button" onClick={() => updatePanelTransform({ rotation: 0, scale: 1 })}>Ausrichtung zurücksetzen</button></div></div><div className="modal-actions"><button className="secondary-button" onClick={() => setShowAdjust(false)}>Schließen</button><button className="primary-button" onClick={() => { setShowAdjust(false); setMessage(`${active.name}: ${active.transform.rotation.toFixed(1)}° · ${Math.round(active.transform.scale * 100)} % Exportgröße.`); }}>Ausrichtung übernehmen</button></div></section></div>}
+      {showRepair && active && <div className="modal-backdrop" onMouseDown={() => setShowRepair(false)}><section className="modal repair-modal" onMouseDown={event => event.stopPropagation()} aria-modal="true" role="dialog" aria-labelledby="repair-title"><button className="modal-close" onClick={() => setShowRepair(false)}>×</button><span className="eyebrow">AUTO-REPAIR · VORSCHAU</span><h2 id="repair-title">Messfehler kontrollieren</h2><p className="modal-lead">Orange markiert die bisherige Messung, Grün die vorgeschlagene Position. Erst „Ausgewählte anwenden“ verändert deine Map.</p><RepairPreview panel={active} points={points} suggestions={repairSuggestions} /><div className="repair-legend"><span><i className="original" /> Original</span><span><i className="proposed" /> Vorschlag</span><span>{selectedRepairCount}/{repairSuggestions.length} ausgewählt</span></div><div className="repair-list">{repairSuggestions.map(suggestion => <label className={`repair-row ${suggestion.selected ? 'selected' : ''}`} key={suggestion.id}><input type="checkbox" checked={suggestion.selected} onChange={() => setRepairSuggestions(items => items.map(item => item.id === suggestion.id ? { ...item, selected: !item.selected } : item))} /><span className="repair-index">#{suggestion.sourceIndex + 1}</span><span className="repair-copy"><strong>{suggestion.reason}</strong><small>{suggestion.before.map(value => value.toFixed(2)).join(' / ')} → {suggestion.after.map(value => value.toFixed(2)).join(' / ')}</small></span><span className={`confidence ${suggestion.confidence}`}>{suggestion.confidence}</span></label>)}</div><div className="repair-note">Die Position wird aus gültigen Indexnachbarn desselben Panels geschätzt. Niedrige Konfidenz ist standardmäßig abgewählt und sollte besonders kritisch geprüft werden.</div><div className="modal-actions"><button className="secondary-button" onClick={() => { setShowRepair(false); setRepairSuggestions([]); setMessage('Reparaturvorschläge verworfen — Originaldaten unverändert.'); }}>Abbrechen</button><button className="primary-button repair-apply" disabled={!selectedRepairCount} onClick={applyRepairs}>{selectedRepairCount} ausgewählte anwenden</button></div></section></div>}
       {showExport && <div className="modal-backdrop" onMouseDown={() => setShowExport(false)}><section className="modal" onMouseDown={e => e.stopPropagation()} aria-modal="true" role="dialog"><button className="modal-close" onClick={() => setShowExport(false)}>×</button><span className="eyebrow">EXPORT</span><h2>MadMapper Fixture erstellen</h2><p className="modal-lead">{enabledPanels.length} Panel{enabledPanels.length === 1 ? '' : 's'} · {fmt.format(enabledPanels.reduce((sum, panel) => sum + panel.indices.length, 0))} LEDs · in Originalreihenfolge</p><div className="form-grid"><label>Fixture Definition<input value={settings.definition} onChange={e => setSettings(s => ({ ...s, definition: e.target.value }))} /></label><label>Kanäle pro Pixel<select value={settings.channels} onChange={e => setSettings(s => ({ ...s, channels: Number(e.target.value), definition: Number(e.target.value) === 4 ? 'Generic - Pixel RGBW' : 'Generic - Pixel RGB' }))}><option value={3}>RGB · 3</option><option value={4}>RGBW · 4</option></select></label><label>Start Universe<input type="number" min="0" max="32767" value={settings.universe} onChange={e => setSettings(s => ({ ...s, universe: Math.max(0, Number(e.target.value)) }))} /></label><label>Start Channel<input type="number" min="1" max="512" value={settings.channel} onChange={e => setSettings(s => ({ ...s, channel: Math.max(1, Math.min(512, Number(e.target.value))) }))} /></label><label>Pixelgröße in MadMapper<input type="number" min="1" max="64" value={settings.ledSize} onChange={e => setSettings(s => ({ ...s, ledSize: Math.max(1, Number(e.target.value)) }))} /></label></div><div className="format-cards"><button onClick={() => exportFile('svg')}><b>SVG 6.1</b><span>Empfohlen</span><small>Exakte freie 2D-Positionen, Gruppen und DMX-Patch.</small></button><button onClick={() => exportFile('csv')}><b>CSV</b><span>Alternative</span><small>Einzelpixel mit Position, Definition und Patch.</small></button><button onClick={() => exportFile('mmfl')}><b>MMFL</b><span>Experimentell</span><small>Fixture-Editor-Definition auf quantisiertem Raster.</small></button></div><div className="format-note"><strong>Warum 2D?</strong> MadMapper importiert keine echten XYZ-Fixture-Koordinaten. Die App projiziert jedes gewählte Panel verlustarm auf seine lokale Ebene; die 3D-Map bleibt unverändert.</div></section></div>}
       {showHelp && <div className="modal-backdrop" onMouseDown={() => setShowHelp(false)}><section className="modal help-modal" onMouseDown={e => e.stopPropagation()}><button className="modal-close" onClick={() => setShowHelp(false)}>×</button><span className="eyebrow">FORMAT-HILFE</span><h2>Welches Format wofür?</h2><div className="help-row"><b>SVG 6.1</b><p>Für File → Import Fixtures. Jede LED wird als eigenes Fixture mit aktuellen <code>universe</code>-, <code>channel</code>- und <code>fixture_definition</code>-Attributen angelegt.</p></div><div className="help-row"><b>CSV</b><p>Robuste Tabellenalternative für Fixture-Instanzen. Semikolon-getrennt und mit Gruppenpfaden pro Panel.</p></div><div className="help-row"><b>MMFL</b><p>Für den Import im Fixture Editor. Das Format beschreibt nur ein 2D-Pixelraster und Kanalbelegung; seine internen Details sind nicht vollständig öffentlich dokumentiert.</p></div><div className="help-warning">Alte MadMapper-5-SVG-Attribute werden bewusst nicht verwendet. Der Export folgt der aktuellen 6.1-Dokumentation.</div></section></div>}
     </main>
