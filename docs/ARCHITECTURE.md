@@ -11,11 +11,13 @@ Pixelblaze JSON / Marimapper CSV
        normalised Vec3 slots
               │
               ▼
-  spatial clustering + diagnostics
+  spatial clustering + pixel editor
               │
        ┌──────┴──────┐
        ▼             ▼
   3D workspace   panel collection
+  click/search      │
+  move/insert       │
                          │
                          ▼
               best-fit plane projection
@@ -28,10 +30,11 @@ Pixelblaze JSON / Marimapper CSV
 
 ## Core decisions
 
-- **Source indices are stable.** Imported LED indices survive clustering, selection, repair, projection, and export.
+- **Source order is stable by default.** Imported LED indices survive clustering, selection, repair, projection, and export. Explicit insertion is the one intentional exception: it creates a new slot and shifts following indices.
 - **Alignment is non-destructive.** A panel stores rotation, scale, and flip flags separately from its 3D points.
-- **Repairs require confirmation.** Analysis generates suggestions with a reason and confidence; coordinates change only after explicit approval.
+- **Repairs require confirmation.** Analysis learns average panel spacing and a matrix/zigzag model, corrects it with up to four previous and four following readings, and only suggests deviations over the user threshold. Coordinates change only after explicit approval.
 - **3D becomes local 2D.** Principal component analysis derives a best-fit plane for each panel. MadMapper exports use coordinates on that plane.
+- **The MMFL preview is export-exact.** The transparent 2D cell overlay and MMFL generator share one quantisation function, so empty preview cells match exported zeros.
 - **DMX packing is deterministic.** Fixture instances are sorted by source index and roll to a new universe before crossing channel 512.
 - **Language is presentation state.** Internal diagnostic codes remain language-neutral and are translated at the UI boundary.
 

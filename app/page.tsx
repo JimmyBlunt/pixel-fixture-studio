@@ -15,12 +15,19 @@ type RepairSuggestion = {
   sourceIndex: number;
   before: Vec3;
   after: Vec3;
-  reason: 'missing-reading' | 'index-gap' | 'position-outlier' | 'local-outlier';
+  reason: 'missing-reading' | 'threshold-deviation';
   confidence: 'high' | 'medium' | 'low';
+  deviationRatio: number;
+  supportCount: number;
   selected: boolean;
 };
-type RepairSensitivity = 'conservative' | 'balanced' | 'sensitive';
 type ParsedMap = { coords: Vec3[]; missingIndices: Set<number>; sourceLabel: string; measuredCount: number };
+type MatrixModel = {
+  averagePitch: number;
+  rowLength: number;
+  serpentine: boolean;
+  positionAt: (sourceIndex: number) => Vec3;
+};
 
 const COLORS = ['#ff4f87', '#8c7cff', '#37d9c5', '#ffae4f', '#4fa8ff', '#d875ff'];
 
@@ -33,6 +40,14 @@ function median(values: number[]) {
   const sorted = [...values].sort((a, b) => a - b);
   const mid = Math.floor(sorted.length / 2);
   return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+function trimmedMean(values: number[], trimFraction = .1) {
+  if (!values.length) return 1;
+  const sorted = [...values].sort((a, b) => a - b);
+  const trim = Math.min(Math.floor(sorted.length * trimFraction), Math.floor((sorted.length - 1) / 2));
+  const kept = sorted.slice(trim, sorted.length - trim);
+  return kept.reduce((sum, value) => sum + value, 0) / kept.length;
 }
 
 function dist(a: Vec3, b: Vec3) {
@@ -186,73 +201,120 @@ function averageVec(values: Vec3[]): Vec3 {
   return values.reduce<Vec3>((sum, value) => add(sum, value), [0, 0, 0]).map(value => value / Math.max(values.length, 1)) as Vec3;
 }
 
-function estimatePosition(sourceIndex: number, valid: MapPoint[], pitch: number) {
-  const before = valid.filter(point => point.sourceIndex < sourceIndex).sort((a, b) => b.sourceIndex - a.sourceIndex);
-  const after = valid.filter(point => point.sourceIndex > sourceIndex).sort((a, b) => a.sourceIndex - b.sourceIndex);
-  const candidates: Vec3[] = [];
-
-  if (before[0] && after[0]) {
-    const span = after[0].sourceIndex - before[0].sourceIndex;
-    const t = (sourceIndex - before[0].sourceIndex) / Math.max(span, 1);
-    candidates.push(add(before[0].xyz, scaleVec(sub(after[0].xyz, before[0].xyz), t)));
-  }
-  if (before[0] && before[1]) {
-    const step = scaleVec(sub(before[0].xyz, before[1].xyz), 1 / Math.max(before[0].sourceIndex - before[1].sourceIndex, 1));
-    candidates.push(add(before[0].xyz, scaleVec(step, sourceIndex - before[0].sourceIndex)));
-  }
-  if (after[0] && after[1]) {
-    const step = scaleVec(sub(after[1].xyz, after[0].xyz), 1 / Math.max(after[1].sourceIndex - after[0].sourceIndex, 1));
-    candidates.push(sub(after[0].xyz, scaleVec(step, after[0].sourceIndex - sourceIndex)));
-  }
-  if (!candidates.length) return null;
-
-  const position = averageVec(candidates);
-  const disagreement = Math.max(...candidates.map(candidate => dist(candidate, position)), 0);
-  const support = Math.min(before.length, 2) + Math.min(after.length, 2);
-  const confidence: RepairSuggestion['confidence'] = support >= 4 && disagreement <= pitch * .7 ? 'high' : support >= 2 && disagreement <= pitch * 1.6 ? 'medium' : 'low';
-  return { position, confidence };
+function mode(values: number[]) {
+  const counts = new Map<number, number>();
+  values.forEach(value => counts.set(value, (counts.get(value) ?? 0) + 1));
+  return [...counts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0];
 }
 
-/** Suggest repairs from index-neighbour interpolation without mutating source data. */
-function findRepairSuggestions(panel: Panel, points: MapPoint[], pitch: number, sensitivity: RepairSensitivity = 'conservative'): RepairSuggestion[] {
-  if (!panel.indices.length) return [];
-  const sortedPanel = [...panel.indices].sort((a, b) => a - b);
-  const minIndex = sortedPanel[0], maxIndex = sortedPanel[sortedPanel.length - 1];
-  const panelSet = new Set(sortedPanel);
-  const suspectReasons = new Map<number, RepairSuggestion['reason']>();
-  const profile = sensitivity === 'sensitive' ? { gap: 2, localShift: 1.8, neighborSpan: 3.2, repairShift: 1.1, allowLow: true } : sensitivity === 'balanced' ? { gap: 1, localShift: 2.4, neighborSpan: 2.9, repairShift: 1.7, allowLow: false } : { gap: 1, localShift: 3.2, neighborSpan: 2.6, repairShift: 2.4, allowLow: false };
-  const isBracketed = (index: number) => {
-    let before = false, after = false;
-    for (let step = 1; step <= profile.gap; step++) { before ||= panelSet.has(index - step); after ||= panelSet.has(index + step); }
-    return before && after;
-  };
+function modulo(value: number, divisor: number) {
+  return ((value % divisor) + divisor) % divisor;
+}
 
-  for (let index = minIndex; index <= maxIndex; index++) {
-    const point = points[index];
-    if (!point || !isBracketed(index)) continue;
-    if (point.status === 'placeholder') suspectReasons.set(index, 'missing-reading');
-    else if (point.status === 'outlier') suspectReasons.set(index, 'position-outlier');
-    else if (!panelSet.has(index) && sensitivity !== 'conservative') suspectReasons.set(index, 'index-gap');
-  }
-
-  sortedPanel.forEach((index, rank) => {
-    if (rank === 0 || rank === sortedPanel.length - 1 || suspectReasons.has(index)) return;
-    const current = points[index], previous = points[sortedPanel[rank - 1]], next = points[sortedPanel[rank + 1]];
-    if (!current || !previous || !next || previous.status !== 'ok' || next.status !== 'ok' || index - previous.sourceIndex > profile.gap || next.sourceIndex - index > profile.gap) return;
-    const midpoint = averageVec([previous.xyz, next.xyz]);
-    const neighborSpan = dist(previous.xyz, next.xyz);
-    if (neighborSpan <= pitch * profile.neighborSpan && dist(current.xyz, midpoint) > pitch * profile.localShift) suspectReasons.set(index, 'local-outlier');
+/** Learn a quantised row/column model from the complete panel measurement. */
+function buildMatrixModel(panel: Panel, points: MapPoint[], fallbackPitch: number): MatrixModel | null {
+  const basis = getPanelBasis(panel, points);
+  const valid = panel.indices.map(index => points[index]).filter(point => point?.status === 'ok');
+  if (!basis || valid.length < 8) return null;
+  const projected = valid.map(point => ({ point, ...projectXyz(point.xyz, basis) }));
+  const nearest = projected.map((point, index) => Math.min(...projected.filter((_, other) => index !== other).map(other => Math.hypot(point.u - other.u, point.v - other.v)))).filter(Number.isFinite);
+  const averagePitch = Math.max(trimmedMean(nearest), fallbackPitch * .25, .0001);
+  const consecutive = projected.flatMap((point, index) => {
+    const next = projected[index + 1];
+    if (!next || next.point.sourceIndex !== point.point.sourceIndex + 1) return [];
+    const du = next.u - point.u, dv = next.v - point.v, length = Math.hypot(du, dv);
+    return length <= averagePitch * 1.8 ? [{ sourceIndex: point.point.sourceIndex, du, dv, length }] : [];
   });
+  if (consecutive.length < 4) return null;
 
-  const suspects = new Set(suspectReasons.keys());
-  const valid = points.filter(point => point.sourceIndex >= minIndex && point.sourceIndex <= maxIndex && panelSet.has(point.sourceIndex) && point.status === 'ok' && !suspects.has(point.sourceIndex));
-  return [...suspectReasons.entries()].sort((a, b) => a[0] - b[0]).flatMap(([sourceIndex, reason]) => {
-    const estimate = estimatePosition(sourceIndex, valid, pitch);
-    const point = points[sourceIndex];
-    if (!estimate || !point) return [];
-    if (!profile.allowLow && estimate.confidence === 'low') return [];
-    if ((reason === 'position-outlier' || reason === 'local-outlier') && dist(point.xyz, estimate.position) < pitch * profile.repairShift) return [];
-    return [{ id: `repair-${sourceIndex}`, sourceIndex, before: point.xyz, after: estimate.position, reason, confidence: estimate.confidence, selected: estimate.confidence !== 'low' }];
+  const angleBins = Array.from({ length: 36 }, () => 0);
+  consecutive.forEach(step => {
+    const angle = modulo(Math.atan2(step.dv, step.du), Math.PI);
+    angleBins[Math.min(35, Math.floor(angle / Math.PI * angleBins.length))] += 1 / Math.max(Math.abs(step.length - averagePitch), averagePitch * .08);
+  });
+  const dominantBin = angleBins.indexOf(Math.max(...angleBins));
+  const rowAngle = (dominantBin + .5) / angleBins.length * Math.PI;
+  const rowUnit = { u: Math.cos(rowAngle), v: Math.sin(rowAngle) };
+  const columnUnit = { u: -rowUnit.v, v: rowUnit.u };
+  const anchor = projected[0];
+  const gridByIndex = new Map(projected.map(item => {
+    const du = item.u - anchor.u, dv = item.v - anchor.v;
+    return [item.point.sourceIndex, { x: Math.round((du * rowUnit.u + dv * rowUnit.v) / averagePitch), y: Math.round((du * columnUnit.u + dv * columnUnit.v) / averagePitch) }] as const;
+  }));
+  const gridSteps = consecutive.flatMap(step => {
+    const current = gridByIndex.get(step.sourceIndex), next = gridByIndex.get(step.sourceIndex + 1);
+    if (!current || !next) return [];
+    const dx = next.x - current.x, dy = next.y - current.y;
+    return Math.abs(dx) + Math.abs(dy) <= 2 ? [{ sourceIndex: step.sourceIndex, dx, dy }] : [];
+  });
+  const breaks = gridSteps.filter(step => Math.abs(step.dy) >= Math.abs(step.dx));
+  const breakGaps = breaks.slice(1).map((step, index) => step.sourceIndex - breaks[index].sourceIndex).filter(gap => gap >= 2);
+  const xValues = [...gridByIndex.values()].map(value => value.x);
+  const rowLength = Math.max(2, Math.round(breakGaps.length ? median(breakGaps) : Math.max(...xValues) - Math.min(...xValues) + 1));
+  const breakPhase = mode(breaks.map(step => modulo(step.sourceIndex, rowLength))) ?? modulo(panel.indices[0] + rowLength - 1, rowLength);
+  const rowStartPhase = modulo(breakPhase + 1, rowLength);
+  const rowOf = (sourceIndex: number) => Math.floor((sourceIndex - rowStartPhase) / rowLength);
+  const columnOf = (sourceIndex: number) => modulo(sourceIndex - rowStartPhase, rowLength);
+  const horizontal = gridSteps.filter(step => Math.abs(step.dx) > Math.abs(step.dy));
+  const signs = new Set(horizontal.map(step => Math.sign(step.dx)).filter(Boolean));
+  const serpentine = signs.size > 1;
+  const referenceRow = Math.min(...valid.map(point => rowOf(point.sourceIndex)));
+  const referenceSteps = horizontal.filter(step => modulo(rowOf(step.sourceIndex) - referenceRow, 2) === 0);
+  const xSign = Math.sign(median((referenceSteps.length ? referenceSteps : horizontal).map(step => step.dx))) || 1;
+  const ySign = Math.sign(median(breaks.map(step => step.dy))) || 1;
+  const patternX = (sourceIndex: number) => {
+    const row = rowOf(sourceIndex), column = columnOf(sourceIndex);
+    const reverse = serpentine && modulo(row - referenceRow, 2) === 1;
+    return (reverse ? rowLength - 1 - column : column) * xSign;
+  };
+  const patternY = (sourceIndex: number) => (rowOf(sourceIndex) - referenceRow) * ySign;
+  const xOrigin = median(valid.map(point => gridByIndex.get(point.sourceIndex)!.x - patternX(point.sourceIndex)));
+  const yOrigin = median(valid.map(point => gridByIndex.get(point.sourceIndex)!.y - patternY(point.sourceIndex)));
+  const positionAt = (sourceIndex: number): Vec3 => {
+    const gridX = xOrigin + patternX(sourceIndex), gridY = yOrigin + patternY(sourceIndex);
+    const u = anchor.u + (rowUnit.u * gridX + columnUnit.u * gridY) * averagePitch;
+    const v = anchor.v + (rowUnit.v * gridX + columnUnit.v * gridY) * averagePitch;
+    return add(basis.center, add(scaleVec(basis.e1, u), scaleVec(basis.e2, -v)));
+  };
+  return { averagePitch, rowLength, serpentine, positionAt };
+}
+
+/** Combine the matrix prediction with residuals from four previous and four following pixels. */
+function estimateExpectedPosition(sourceIndex: number, panel: Panel, points: MapPoint[], pitch: number, model = buildMatrixModel(panel, points, pitch)) {
+  const panelSet = new Set(panel.indices);
+  const valid = points.filter(point => panelSet.has(point.sourceIndex) && point.status === 'ok' && point.sourceIndex !== sourceIndex);
+  const before = valid.filter(point => point.sourceIndex < sourceIndex).sort((a, b) => b.sourceIndex - a.sourceIndex).slice(0, 4);
+  const after = valid.filter(point => point.sourceIndex > sourceIndex).sort((a, b) => a.sourceIndex - b.sourceIndex).slice(0, 4);
+  const neighbours = [...before, ...after];
+  if (model && neighbours.length >= 2) {
+    const residuals = neighbours.map(point => sub(point.xyz, model.positionAt(point.sourceIndex))).filter(residual => Math.hypot(...residual) <= model.averagePitch * 2.5);
+    const correction = residuals.length ? averageVec(residuals) : [0, 0, 0] as Vec3;
+    return { position: add(model.positionAt(sourceIndex), correction), supportCount: neighbours.length, model };
+  }
+  const candidates: Vec3[] = [];
+  if (before[0] && after[0]) {
+    const span = after[0].sourceIndex - before[0].sourceIndex;
+    candidates.push(add(before[0].xyz, scaleVec(sub(after[0].xyz, before[0].xyz), (sourceIndex - before[0].sourceIndex) / Math.max(span, 1))));
+  }
+  if (before[0] && before[1]) candidates.push(add(before[0].xyz, scaleVec(sub(before[0].xyz, before[1].xyz), sourceIndex - before[0].sourceIndex)));
+  if (after[0] && after[1]) candidates.push(sub(after[0].xyz, scaleVec(sub(after[1].xyz, after[0].xyz), after[0].sourceIndex - sourceIndex)));
+  return candidates.length ? { position: averageVec(candidates), supportCount: neighbours.length, model: null } : null;
+}
+
+/** Suggest only points whose deviation exceeds the user-defined multiple of average LED spacing. */
+function findRepairSuggestions(panel: Panel, points: MapPoint[], pitch: number, threshold: number): RepairSuggestion[] {
+  if (!panel.indices.length) return [];
+  const model = buildMatrixModel(panel, points, pitch);
+  const sorted = [...panel.indices].sort((a, b) => a - b);
+  const minIndex = sorted[0], maxIndex = sorted[sorted.length - 1];
+  return points.slice(minIndex, maxIndex + 1).flatMap(point => {
+    const estimate = estimateExpectedPosition(point.sourceIndex, panel, points, pitch, model);
+    if (!estimate || estimate.supportCount < 2) return [];
+    const averagePitch = model?.averagePitch ?? pitch;
+    const deviationRatio = point.status === 'placeholder' ? Infinity : dist(point.xyz, estimate.position) / Math.max(averagePitch, .0001);
+    if (deviationRatio <= threshold) return [];
+    const confidence: RepairSuggestion['confidence'] = estimate.supportCount >= 6 && model ? 'high' : estimate.supportCount >= 4 ? 'medium' : 'low';
+    return [{ id: `repair-${point.sourceIndex}`, sourceIndex: point.sourceIndex, before: point.xyz, after: estimate.position, reason: point.status === 'placeholder' ? 'missing-reading' : 'threshold-deviation', confidence, deviationRatio, supportCount: estimate.supportCount, selected: confidence !== 'low' }];
   });
 }
 
@@ -313,16 +375,25 @@ function buildCsv(panels: Panel[], points: MapPoint[], settings: ExportSettings)
   return rows.join('\n') + '\n';
 }
 
+/** Use the same quantised cells for the MMFL file and its transparent preview grid. */
+function quantizePanelGrid(panel: Panel, points: MapPoint[], channels = 3) {
+  const baseProjected = projectPanel(panel, points);
+  const projected = transformProjection(baseProjected, panel.transform);
+  if (!projected.length) return { projected, pitch: 1, uMin: 0, vMin: 0, cells: [] as { x: number; y: number; value: number; sourceIndex: number }[], width: 1, height: 1 };
+  const nearest2d = baseProjected.map((p, i) => Math.min(...baseProjected.filter((_, j) => i !== j).map(q => Math.hypot(p.u - q.u, p.v - q.v)))).filter(Number.isFinite);
+  const pitch = Math.max(median(nearest2d), .001);
+  const uMin = Math.min(...projected.map(point => point.u));
+  const vMin = Math.min(...projected.map(point => point.v));
+  const cells = projected.map((point, rank) => ({ x: Math.round((point.u - uMin) / pitch), y: Math.round((point.v - vMin) / pitch), value: 1 + rank * channels, sourceIndex: point.sourceIndex }));
+  const width = Math.max(...cells.map(cell => cell.x)) + 1;
+  const height = Math.max(...cells.map(cell => cell.y)) + 1;
+  return { projected, pitch, uMin, vMin, cells, width, height };
+}
+
 /** Generate an experimental MMFL fixture library using a quantised LED grid. */
 function buildMmfl(panels: Panel[], points: MapPoint[], settings: ExportSettings) {
   const fixtures = panels.map(panel => {
-    const baseProjected = projectPanel(panel, points);
-    const projected = transformProjection(baseProjected, panel.transform);
-    const nearest2d = baseProjected.map((p, i) => Math.min(...baseProjected.filter((_, j) => i !== j).map(q => Math.hypot(p.u - q.u, p.v - q.v)))).filter(Number.isFinite);
-    const pitch = Math.max(median(nearest2d), .001);
-    const uMin = Math.min(...projected.map(p => p.u)), vMin = Math.min(...projected.map(p => p.v));
-    const cells = projected.map((p, rank) => ({ x: Math.round((p.u - uMin) / pitch), y: Math.round((p.v - vMin) / pitch), value: 1 + rank * settings.channels }));
-    const width = Math.max(...cells.map(c => c.x)) + 1, height = Math.max(...cells.map(c => c.y)) + 1;
+    const { cells, width, height } = quantizePanelGrid(panel, points, settings.channels);
     const grid = Array.from({ length: width * height }, () => 0);
     cells.forEach(cell => { if (!grid[cell.y * width + cell.x]) grid[cell.y * width + cell.x] = cell.value; });
     return `  <LEDFixture favorite="1" group="Pixel Fixture Studio" product="${xmlEscape(panel.name)}">\n    <PixelMapping avoidCrossUniversePixels="1" type="${settings.channels === 4 ? 'RGBW' : 'RGB'}" height="${height}" width="${width}">${grid.join(' ')}</PixelMapping>\n  </LEDFixture>`;
@@ -338,9 +409,9 @@ function download(name: string, content: string, type: string) {
   setTimeout(() => URL.revokeObjectURL(link.href), 1000);
 }
 
-function MapCanvas({ points, panels, selectionMode, onSelection, camera, onCameraChange, language }: { points: MapPoint[]; panels: Panel[]; selectionMode: boolean; onSelection: (indices: number[]) => void; camera: Camera; onCameraChange: (camera: Camera) => void; language: Language }) {
+function MapCanvas({ points, panels, selectionMode, showPixelNumbers, selectedIndices, onSelection, camera, onCameraChange, language }: { points: MapPoint[]; panels: Panel[]; selectionMode: boolean; showPixelNumbers: boolean; selectedIndices: number[]; onSelection: (indices: number[], additive?: boolean) => void; camera: Camera; onCameraChange: (camera: Camera) => void; language: Language }) {
   const ref = useRef<HTMLCanvasElement>(null);
-  const drag = useRef<{ x: number; y: number; yaw: number; pitch: number; selecting: boolean } | null>(null);
+  const drag = useRef<{ x: number; y: number; yaw: number; pitch: number; selecting: boolean; additive: boolean; moved: boolean } | null>(null);
   const [box, setBox] = useState<{ x1: number; y1: number; x2: number; y2: number } | null>(null);
   const [revision, setRevision] = useState(0);
   const projectedRef = useRef<{ index: number; x: number; y: number }[]>([]);
@@ -352,7 +423,8 @@ function MapCanvas({ points, panels, selectionMode, onSelection, camera, onCamer
       const rect = canvas.getBoundingClientRect(), ratio = window.devicePixelRatio || 1;
       canvas.width = rect.width * ratio; canvas.height = rect.height * ratio; ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
       ctx.clearRect(0, 0, rect.width, rect.height);
-      const visible = panels.filter(p => p.enabled).flatMap(panel => panel.indices.map(index => ({ index, color: panel.color })));
+      const visible = panels.filter(p => p.enabled).flatMap(panel => panel.indices.map(index => ({ index, color: panel.color }))).filter(item => points[item.index]);
+      const selected = new Set(selectedIndices);
       const center: Vec3 = [0, 0, 0]; visible.forEach(item => points[item.index].xyz.forEach((n, i) => center[i] += n / Math.max(visible.length, 1)));
       const rotated = visible.map(item => {
         const p = points[item.index].xyz, x = p[0] - center[0], y = p[1] - center[1], z = p[2] - center[2];
@@ -366,7 +438,13 @@ function MapCanvas({ points, panels, selectionMode, onSelection, camera, onCamer
       for (let i = -5; i <= 5; i++) { ctx.beginPath(); ctx.moveTo(rect.width * .08, rect.height / 2 + i * 38); ctx.lineTo(rect.width * .92, rect.height / 2 + i * 38); ctx.stroke(); }
       rotated.sort((a, b) => a.z - b.z);
       projectedRef.current = rotated.map(p => ({ index: p.index, x: rect.width / 2 + p.x * scale, y: rect.height / 2 - p.y * scale }));
-      rotated.forEach((p, i) => { const screen = projectedRef.current[i]; ctx.shadowColor = p.color; ctx.shadowBlur = 8; ctx.fillStyle = p.color; ctx.globalAlpha = .66 + i / Math.max(rotated.length, 1) * .34; ctx.beginPath(); ctx.arc(screen.x, screen.y, Math.max(2, Math.min(4.2, 2.3 * camera.zoom)), 0, Math.PI * 2); ctx.fill(); });
+      rotated.forEach((p, i) => {
+        const screen = projectedRef.current[i], isSelected = selected.has(p.index);
+        ctx.shadowColor = p.color; ctx.shadowBlur = isSelected ? 15 : 8; ctx.fillStyle = isSelected ? '#ffffff' : p.color; ctx.globalAlpha = .66 + i / Math.max(rotated.length, 1) * .34;
+        ctx.beginPath(); ctx.arc(screen.x, screen.y, Math.max(2, Math.min(isSelected ? 6.5 : 4.2, (isSelected ? 3.8 : 2.3) * camera.zoom)), 0, Math.PI * 2); ctx.fill();
+        if (isSelected) { ctx.globalAlpha = 1; ctx.strokeStyle = '#ff4f87'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(screen.x, screen.y, Math.max(7, 5 * camera.zoom), 0, Math.PI * 2); ctx.stroke(); }
+        if (showPixelNumbers) { ctx.globalAlpha = .95; ctx.shadowBlur = 3; ctx.font = `${Math.max(9, Math.min(13, 9 * camera.zoom))}px ui-monospace, monospace`; ctx.fillStyle = '#eef3ff'; ctx.fillText(String(p.index + 1), screen.x + 6, screen.y - 6); }
+      });
       ctx.globalAlpha = 1; ctx.shadowBlur = 0;
       points.filter(p => p.status !== 'ok').forEach(p => {
         const visiblePoint = projectedRef.current.find(q => q.index === p.sourceIndex); if (!visiblePoint) return;
@@ -375,26 +453,32 @@ function MapCanvas({ points, panels, selectionMode, onSelection, camera, onCamer
       if (box) { ctx.fillStyle = 'rgba(255,79,135,.12)'; ctx.strokeStyle = '#ff4f87'; ctx.setLineDash([5, 4]); ctx.fillRect(box.x1, box.y1, box.x2 - box.x1, box.y2 - box.y1); ctx.strokeRect(box.x1, box.y1, box.x2 - box.x1, box.y2 - box.y1); ctx.setLineDash([]); }
     };
     render(); const observer = new ResizeObserver(render); observer.observe(canvas); return () => observer.disconnect();
-  }, [points, panels, box, revision, camera]);
+  }, [points, panels, box, revision, camera, selectedIndices, showPixelNumbers]);
 
   const pointerDown = (event: ReactPointerEvent<HTMLCanvasElement>) => {
     event.currentTarget.setPointerCapture(event.pointerId);
     const r = event.currentTarget.getBoundingClientRect(); const x = event.clientX - r.left, y = event.clientY - r.top;
     const selecting = selectionMode || event.shiftKey;
-    drag.current = { x, y, yaw: camera.yaw, pitch: camera.pitch, selecting };
+    drag.current = { x, y, yaw: camera.yaw, pitch: camera.pitch, selecting, additive: event.shiftKey || event.ctrlKey || event.metaKey, moved: false };
     if (selecting) setBox({ x1: x, y1: y, x2: x, y2: y });
   };
   const pointerMove = (event: ReactPointerEvent<HTMLCanvasElement>) => {
     if (!drag.current) return; const r = event.currentTarget.getBoundingClientRect(); const x = event.clientX - r.left, y = event.clientY - r.top;
+    if (Math.hypot(x - drag.current.x, y - drag.current.y) > 4) drag.current.moved = true;
     if (drag.current.selecting) setBox(old => old ? { ...old, x2: x, y2: y } : null);
     else { onCameraChange({ ...camera, yaw: drag.current.yaw + (x - drag.current.x) * .008, pitch: Math.max(-1.5, Math.min(1.5, drag.current.pitch + (y - drag.current.y) * .008)) }); setRevision(v => v + 1); }
   };
   const pointerUp = () => {
-    if (drag.current?.selecting && box) {
+    if (!drag.current) return;
+    if (drag.current.selecting && box && drag.current.moved) {
       const minX = Math.min(box.x1, box.x2), maxX = Math.max(box.x1, box.x2), minY = Math.min(box.y1, box.y2), maxY = Math.max(box.y1, box.y2);
-      onSelection(projectedRef.current.filter(p => p.x >= minX && p.x <= maxX && p.y >= minY && p.y <= maxY).map(p => p.index));
-      setBox(null);
+      onSelection(projectedRef.current.filter(p => p.x >= minX && p.x <= maxX && p.y >= minY && p.y <= maxY).map(p => p.index), drag.current.additive);
+    } else if (!drag.current.moved) {
+      const nearest = projectedRef.current.map(point => ({ ...point, distance: Math.hypot(point.x - drag.current!.x, point.y - drag.current!.y) })).sort((a, b) => a.distance - b.distance)[0];
+      if (nearest?.distance <= 14) onSelection([nearest.index], drag.current.additive);
+      else if (!drag.current.additive) onSelection([]);
     }
+    setBox(null);
     drag.current = null;
   };
   const wheel = (event: React.WheelEvent<HTMLCanvasElement>) => { event.preventDefault(); onCameraChange({ ...camera, zoom: Math.max(.3, Math.min(5, camera.zoom * Math.exp(-event.deltaY * .001))) }); setRevision(v => v + 1); };
@@ -409,7 +493,7 @@ function normalizeDegrees(value: number) {
   return Math.round(normalized * 10) / 10;
 }
 
-function FixturePreview({ panel, points, ledSize, interactive = false, onTransform, language }: { panel?: Panel; points: MapPoint[]; ledSize: number; interactive?: boolean; onTransform?: (transform: PanelTransform) => void; language: Language }) {
+function FixturePreview({ panel, points, ledSize, interactive = false, showOutputGrid = false, onTransform, language }: { panel?: Panel; points: MapPoint[]; ledSize: number; interactive?: boolean; showOutputGrid?: boolean; onTransform?: (transform: PanelTransform) => void; language: Language }) {
   const ref = useRef<HTMLCanvasElement>(null);
   const drag = useRef<{ angle: number; rotation: number } | null>(null);
   useEffect(() => {
@@ -425,6 +509,18 @@ function FixturePreview({ panel, points, ledSize, interactive = false, onTransfo
       if (!projected.length || !baseProjected.length) return;
       const span = Math.max(...baseProjected.flatMap(point => [Math.abs(point.u), Math.abs(point.v)]), .001);
       const scale = Math.min(rect.width, rect.height) * .4 / span;
+      if (showOutputGrid && panel) {
+        const grid = quantizePanelGrid(panel, points);
+        const occupied = new Set(grid.cells.map(cell => `${cell.x}:${cell.y}`));
+        const cellSize = Math.max(3, grid.pitch * scale * .88);
+        for (let row = 0; row < grid.height; row++) for (let column = 0; column < grid.width; column++) {
+          const x = centerX + (grid.uMin + column * grid.pitch) * scale;
+          const y = centerY + (grid.vMin + row * grid.pitch) * scale;
+          ctx.fillStyle = occupied.has(`${column}:${row}`) ? 'rgba(140,124,255,.12)' : 'rgba(140,124,255,.035)';
+          ctx.strokeStyle = occupied.has(`${column}:${row}`) ? 'rgba(184,174,255,.5)' : 'rgba(140,124,255,.22)';
+          ctx.lineWidth = 1; ctx.fillRect(x - cellSize / 2, y - cellSize / 2, cellSize, cellSize); ctx.strokeRect(x - cellSize / 2, y - cellSize / 2, cellSize, cellSize);
+        }
+      }
       projected.forEach((point, index) => {
         const x = centerX + point.u * scale, y = centerY + point.v * scale;
         ctx.fillStyle = panel?.color ?? '#ff4f87'; ctx.shadowColor = panel?.color ?? '#ff4f87'; ctx.shadowBlur = interactive ? 7 : 4; ctx.globalAlpha = .62 + .38 * index / projected.length;
@@ -434,7 +530,7 @@ function FixturePreview({ panel, points, ledSize, interactive = false, onTransfo
       ctx.globalAlpha = 1; ctx.shadowBlur = 0;
     };
     render(); const observer = new ResizeObserver(render); observer.observe(canvas); return () => observer.disconnect();
-  }, [panel, points, ledSize, interactive]);
+  }, [panel, points, ledSize, interactive, showOutputGrid]);
 
   const pointerAngle = (event: ReactPointerEvent<HTMLCanvasElement>) => {
     const rect = event.currentTarget.getBoundingClientRect();
@@ -512,6 +608,12 @@ export default function Home() {
   const [stageMode, setStageMode] = useState<'3d' | '2d'>('3d');
   const [selectionMode, setSelectionMode] = useState(false);
   const [selection, setSelection] = useState<number[]>([]);
+  const [showPixelNumbers, setShowPixelNumbers] = useState(false);
+  const [editMode, setEditMode] = useState(false);
+  const [moveStep, setMoveStep] = useState(.1);
+  const [pixelSearch, setPixelSearch] = useState('');
+  const [insertAt, setInsertAt] = useState('');
+  const [showOutputGrid, setShowOutputGrid] = useState(false);
   const [message, setMessage] = useState('Demo data is active — load a Pixelblaze JSON or Marimapper CSV file.');
   const [error, setError] = useState('');
   const [showExport, setShowExport] = useState(false);
@@ -519,7 +621,7 @@ export default function Home() {
   const [showAdjust, setShowAdjust] = useState(false);
   const [showRepair, setShowRepair] = useState(false);
   const [repairSuggestions, setRepairSuggestions] = useState<RepairSuggestion[]>([]);
-  const [repairSensitivity, setRepairSensitivity] = useState<RepairSensitivity>('conservative');
+  const [repairThreshold, setRepairThreshold] = useState(1.25);
   const [repairZoom, setRepairZoom] = useState(1);
   const [settings, setSettings] = useState<ExportSettings>({ universe: 0, channel: 1, channels: 3, ledSize: 6, definition: 'Generic - Pixel RGB' });
   const inputRef = useRef<HTMLInputElement>(null);
@@ -530,11 +632,30 @@ export default function Home() {
   const placeholders = points.filter(point => point.status === 'placeholder').length;
   const outliers = points.filter(point => point.status === 'outlier').length;
   const selectedRepairCount = repairSuggestions.filter(suggestion => suggestion.selected).length;
+  const selectedPoint = selection.length === 1 ? points[selection[0]] : undefined;
+  const repairModel = useMemo(() => active ? buildMatrixModel(active, points, pitch) : null, [active, points, pitch]);
   const viewLabel = view === 'Top' ? t('Top', 'Oben') : view === 'Side' ? t('Side', 'Seite') : view;
 
   useEffect(() => {
     document.documentElement.lang = language;
   }, [language]);
+
+  useEffect(() => {
+    const moveWithKeyboard = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (!editMode || !selection.length || target?.matches('input, select, textarea, [contenteditable="true"]')) return;
+      const amount = moveStep * (event.shiftKey ? 10 : 1);
+      const delta: Vec3 | undefined = event.key === 'ArrowLeft' ? [-amount, 0, 0] : event.key === 'ArrowRight' ? [amount, 0, 0] : event.key === 'ArrowUp' ? [0, amount, 0] : event.key === 'ArrowDown' ? [0, -amount, 0] : event.key === 'PageUp' ? [0, 0, amount] : event.key === 'PageDown' ? [0, 0, -amount] : undefined;
+      if (!delta) return;
+      event.preventDefault();
+      const selected = new Set(selection);
+      setPoints(items => items.map(point => selected.has(point.sourceIndex) ? { ...point, xyz: add(point.xyz, delta), status: 'ok' } : point));
+      setRepairSuggestions([]);
+      setMessage(translated(language, `${selection.length} pixel${selection.length === 1 ? '' : 's'} moved.`, `${selection.length} Pixel verschoben.`));
+    };
+    window.addEventListener('keydown', moveWithKeyboard);
+    return () => window.removeEventListener('keydown', moveWithKeyboard);
+  }, [editMode, language, moveStep, selection]);
 
   const changeLanguage = (next: Language) => {
     setLanguage(next);
@@ -561,6 +682,8 @@ export default function Home() {
       setPitch(result.pitch);
       setFileName(file.name);
       setSelection([]);
+      setPixelSearch('');
+      setInsertAt('');
       setRepairSuggestions([]);
       setRepairZoom(1);
       setShowRepair(false);
@@ -579,6 +702,50 @@ export default function Home() {
   };
 
   const togglePanel = (id: string) => setPanels(items => items.map(item => item.id === id ? { ...item, enabled: !item.enabled } : item));
+  const selectPixels = (indices: number[], additive = false) => {
+    const valid = indices.filter(index => points[index]);
+    setSelection(current => {
+      if (!additive) return [...new Set(valid)].sort((a, b) => a - b);
+      if (valid.length === 1) return current.includes(valid[0]) ? current.filter(index => index !== valid[0]) : [...current, valid[0]].sort((a, b) => a - b);
+      return [...new Set([...current, ...valid])].sort((a, b) => a - b);
+    });
+    const owner = panels.find(panel => valid.some(index => panel.indices.includes(index)));
+    if (owner) setActiveId(owner.id);
+    setMessage(t(valid.length ? `${valid.length} pixel${valid.length === 1 ? '' : 's'} selected.` : 'Selection cleared.', valid.length ? `${valid.length} Pixel ausgewählt.` : 'Auswahl aufgehoben.'));
+  };
+  const moveSelected = (delta: Vec3) => {
+    if (!selection.length) return;
+    const selected = new Set(selection);
+    setPoints(items => items.map(point => selected.has(point.sourceIndex) ? { ...point, xyz: add(point.xyz, delta), status: 'ok' } : point));
+    setRepairSuggestions([]);
+    setMessage(t(`${selection.length} pixel${selection.length === 1 ? '' : 's'} moved.`, `${selection.length} Pixel verschoben.`));
+  };
+  const updateCoordinate = (axis: 0 | 1 | 2, value: number) => {
+    if (!selectedPoint || !Number.isFinite(value)) return;
+    setPoints(items => items.map(point => point.sourceIndex === selectedPoint.sourceIndex ? { ...point, xyz: point.xyz.map((coordinate, index) => index === axis ? value : coordinate) as Vec3, status: 'ok' } : point));
+    setRepairSuggestions([]);
+  };
+  const searchForPixel = () => {
+    const index = Math.trunc(Number(pixelSearch)) - 1;
+    if (!Number.isInteger(index) || !points[index]) { setError(t('Enter an existing pixel number.', 'Gib eine vorhandene Pixelnummer ein.')); return; }
+    setError(''); selectPixels([index]);
+  };
+  const insertPixel = () => {
+    if (!active) return;
+    const fallback = selectedPoint ? selectedPoint.sourceIndex + 2 : points.length + 1;
+    const requested = insertAt.trim() ? Math.trunc(Number(insertAt)) : fallback;
+    if (!Number.isInteger(requested) || requested < 1 || requested > points.length + 1) { setError(t(`Choose a position between 1 and ${points.length + 1}.`, `Wähle eine Position zwischen 1 und ${points.length + 1}.`)); return; }
+    const index = requested - 1, before = points[index - 1], after = points[index];
+    const xyz: Vec3 = before && after ? averageVec([before.xyz, after.xyz]) : before && points[index - 2] ? add(before.xyz, sub(before.xyz, points[index - 2].xyz)) : after ? after.xyz : [0, 0, 0];
+    const inserted: MapPoint = { sourceIndex: index, xyz, status: 'ok' };
+    setPoints(items => [...items.slice(0, index), inserted, ...items.slice(index)].map((point, sourceIndex) => ({ ...point, sourceIndex })));
+    setPanels(items => items.map(panel => {
+      const shifted = panel.indices.map(pixelIndex => pixelIndex >= index ? pixelIndex + 1 : pixelIndex);
+      return panel.id === active.id ? { ...panel, indices: [...new Set([...shifted, index])].sort((a, b) => a - b) } : { ...panel, indices: shifted };
+    }));
+    setSelection([index]); setPixelSearch(String(requested)); setInsertAt(''); setRepairSuggestions([]); setError('');
+    setMessage(t(`Pixel ${requested} inserted into ${active.name}; following numbers were shifted.`, `Pixel ${requested} wurde in ${active.name} eingefügt; folgende Nummern wurden verschoben.`));
+  };
   const selectView = (nextView: string) => {
     setView(nextView);
     setMapCamera(current => nextView === 'Top' ? { yaw: 0, pitch: -Math.PI / 2, zoom: current.zoom } : nextView === 'Front' ? { yaw: 0, pitch: 0, zoom: current.zoom } : nextView === 'Side' ? { yaw: -Math.PI / 2, pitch: 0, zoom: current.zoom } : { yaw: -.5, pitch: -.28, zoom: current.zoom });
@@ -611,20 +778,20 @@ export default function Home() {
   };
   const openRepairReview = () => {
     if (!active) return;
-    const suggestions = findRepairSuggestions(active, points, pitch, repairSensitivity);
+    const suggestions = findRepairSuggestions(active, points, pitch, repairThreshold);
     setRepairSuggestions(suggestions);
     setRepairZoom(1);
     setShowRepair(true);
     setMessage(suggestions.length
       ? t(`${suggestions.length} possible measurement errors found in ${active.name} — no data has been changed.`, `${suggestions.length} mögliche Messfehler in ${active.name} gefunden — noch nichts verändert.`)
-      : t(`${active.name}: the conservative scan found no clear issues. You can raise the sensitivity in the review.`, `${active.name}: konservative Prüfung ohne eindeutige Treffer. Im Fenster kannst du die Prüfstufe erhöhen.`));
+      : t(`${active.name}: no pixel exceeds ${repairThreshold.toFixed(2)} × average spacing.`, `${active.name}: kein Pixel überschreitet ${repairThreshold.toFixed(2)} × mittleren Abstand.`));
   };
-  const changeRepairSensitivity = (next: RepairSensitivity) => {
-    setRepairSensitivity(next);
+  const changeRepairThreshold = (next: number) => {
+    setRepairThreshold(next);
     if (!active) return;
     const suggestions = findRepairSuggestions(active, points, pitch, next);
     setRepairSuggestions(suggestions);
-    setMessage(t(`${suggestions.length} suggestion${suggestions.length === 1 ? '' : 's'} at the selected sensitivity.`, `${suggestions.length} Vorschlag${suggestions.length === 1 ? '' : 'e'} mit der gewählten Prüfstufe.`));
+    setMessage(t(`${suggestions.length} suggestion${suggestions.length === 1 ? '' : 's'} above ${next.toFixed(2)} × spacing.`, `${suggestions.length} Vorschlag${suggestions.length === 1 ? '' : 'e'} über ${next.toFixed(2)} × Abstand.`));
   };
   const applyRepairs = () => {
     if (!active) return;
@@ -651,9 +818,7 @@ export default function Home() {
   };
   const repairReason = (reason: RepairSuggestion['reason']) => ({
     'missing-reading': t('Missing reading', 'Fehlender Messwert'),
-    'index-gap': t('Index gap', 'Index-Lücke'),
-    'position-outlier': t('Position outlier', 'Positionsausreißer'),
-    'local-outlier': t('Local outlier', 'Lokaler Ausreißer'),
+    'threshold-deviation': t('Deviation above threshold', 'Abweichung über Schwellwert'),
   }[reason]);
   const confidenceLabel = (confidence: RepairSuggestion['confidence']) => ({ high: t('high', 'hoch'), medium: t('medium', 'mittel'), low: t('low', 'niedrig') }[confidence]);
 
@@ -688,6 +853,10 @@ export default function Home() {
             <button className="tool" disabled={!selection.length} onClick={addSelection}>＋ {t('Selection as panel', 'Auswahl als Panel')}</button>
           </div>
           <div className="tool-group">
+            <button className={showPixelNumbers ? 'tool active' : 'tool'} aria-pressed={showPixelNumbers} onClick={() => setShowPixelNumbers(value => !value)}># {t('Show pixel numbers', 'Pixelnummern anzeigen')}</button>
+            <button className={editMode ? 'tool active' : 'tool'} aria-pressed={editMode} onClick={() => setEditMode(value => !value)}>✣ {t('Pixel edit mode', 'Pixel-Bearbeitungsmodus')}</button>
+          </div>
+          <div className="tool-group">
             <button className="tool" disabled={!active} onClick={() => setShowAdjust(true)}>↻ {t('Align active panel', 'Aktives Panel ausrichten')}</button>
             <button className="tool repair-tool" disabled={!active} onClick={openRepairReview}>◇ {t('Review measurements', 'Messfehler prüfen')}</button>
           </div>
@@ -705,14 +874,14 @@ export default function Home() {
           </div>
           <div className={`viewport ${stageMode === '2d' ? 'viewport-2d' : ''}`}>
             {stageMode === '3d' ? <>
-              <MapCanvas language={language} points={points} panels={panels} selectionMode={selectionMode} onSelection={indices => { setSelection(indices); setMessage(t(`${numberFormat.format(indices.length)} LEDs selected inside the box.`, `${numberFormat.format(indices.length)} LEDs im Rahmen markiert.`)); }} camera={mapCamera} onCameraChange={setMapCamera} />
+              <MapCanvas language={language} points={points} panels={panels} selectionMode={selectionMode} showPixelNumbers={showPixelNumbers} selectedIndices={selection} onSelection={selectPixels} camera={mapCamera} onCameraChange={setMapCamera} />
               <div className="axis-chip"><i className="x" /> X <i className="y" /> Y <i className="z" /> Z</div>
-              <div className="canvas-help">{selectionMode ? t('Drag a box to select LEDs', 'Rahmen ziehen, um LEDs zu markieren') : t('Drag: rotate · Wheel: zoom · Shift: select', 'Ziehen: drehen · Mausrad: zoomen · Shift: auswählen')}</div>
+              <div className="canvas-help">{editMode ? t('Click/Shift-click: select · Arrows: X/Y · Page Up/Down: Z · Shift: 10×', 'Klick/Shift-Klick: Auswahl · Pfeile: X/Y · Bild↑/↓: Z · Shift: 10×') : selectionMode ? t('Drag a box to select LEDs', 'Rahmen ziehen, um LEDs zu markieren') : t('Click: select · Drag: rotate · Wheel: zoom · Shift: add selection', 'Klick: auswählen · Ziehen: drehen · Mausrad: zoomen · Shift: Auswahl ergänzen')}</div>
             </> : <>
-              <FixturePreview language={language} panel={active} points={points} ledSize={settings.ledSize} interactive onTransform={updatePanelTransform} />
+              <FixturePreview language={language} panel={active} points={points} ledSize={settings.ledSize} interactive showOutputGrid={showOutputGrid} onTransform={updatePanelTransform} />
               <div className="stage-2d-controls">
                 <label><span>{t('Rotation', 'Rotation')}</span><input type="range" min="-180" max="180" step="0.1" value={active?.transform.rotation ?? 0} onChange={event => active && updatePanelTransform({ ...active.transform, rotation: Number(event.target.value) })} /><output>{active?.transform.rotation.toFixed(1) ?? '0.0'}°</output></label>
-                <div className="stage-snap-buttons"><button onClick={() => snapActive('horizontal')}>↔ Snap H</button><button onClick={() => snapActive('vertical')}>↕ Snap V</button><button className={active?.transform.flipX ? 'active' : ''} onClick={() => flipActive('horizontal')}>⇋ Flip H</button><button className={active?.transform.flipY ? 'active' : ''} onClick={() => flipActive('vertical')}>⇵ Flip V</button></div>
+                <div className="stage-snap-buttons"><button onClick={() => snapActive('horizontal')}>↔ Snap H</button><button onClick={() => snapActive('vertical')}>↕ Snap V</button><button className={active?.transform.flipX ? 'active' : ''} onClick={() => flipActive('horizontal')}>⇋ Flip H</button><button className={active?.transform.flipY ? 'active' : ''} onClick={() => flipActive('vertical')}>⇵ Flip V</button><button className={showOutputGrid ? 'active' : ''} onClick={() => setShowOutputGrid(value => !value)}>▦ {t('MMFL grid', 'MMFL-Raster')}</button></div>
                 <label><span>{t('Export size', 'Exportgröße')}</span><input type="range" min="0.25" max="4" step="0.01" value={active?.transform.scale ?? 1} onChange={event => active && updatePanelTransform({ ...active.transform, scale: Number(event.target.value) })} /><output>{Math.round((active?.transform.scale ?? 1) * 100)} %</output></label>
                 <button className="stage-reset" onClick={() => updatePanelTransform({ rotation: 0, scale: 1, flipX: false, flipY: false })}>{t('Reset', 'Zurücksetzen')}</button>
               </div>
@@ -725,15 +894,27 @@ export default function Home() {
         <aside className="rail right-rail">
           <div className="panel-heading"><div><span className="eyebrow">{t('REGIONS', 'BEREICHE')}</span><h2>{t('Panels & export', 'Panels & Export')}</h2></div><span className="count-chip">{enabledPanels.length}/{panels.length}</span></div>
           <div className="panel-list">{panels.map(panel => <div className={`panel-row ${panel.id === active?.id ? 'chosen' : ''}`} key={panel.id}><button className="panel-main" onClick={() => setActiveId(panel.id)}><span className="color-dot" style={{ background: panel.color }} /><span><strong>{panel.name}</strong><small>{numberFormat.format(panel.indices.length)} LEDs · #{panel.indices[0]}–{panel.indices.at(-1)}</small></span></button><label className="switch" title={t('Enabled for export', 'Für Export aktiv')}><input type="checkbox" checked={panel.enabled} onChange={() => togglePanel(panel.id)} /><i /></label></div>)}</div>
+          <section className="pixel-inspector">
+            <div className="inspector-title"><span className="eyebrow">{t('PIXEL EDITOR', 'PIXEL-EDITOR')}</span><span>{selection.length ? t(`${selection.length} selected`, `${selection.length} ausgewählt`) : t('No selection', 'Keine Auswahl')}</span></div>
+            <div className="pixel-search"><input aria-label={t('Pixel number', 'Pixelnummer')} type="number" min="1" max={points.length} placeholder={t('Pixel #', 'Pixel #')} value={pixelSearch} onChange={event => setPixelSearch(event.target.value)} onKeyDown={event => event.key === 'Enter' && searchForPixel()} /><button onClick={searchForPixel}>{t('Find', 'Suchen')}</button></div>
+            {selectedPoint ? <>
+              <div className="selected-pixel-heading"><strong>Pixel #{selectedPoint.sourceIndex + 1}</strong><span className={`pixel-status ${selectedPoint.status}`}>{selectedPoint.status}</span></div>
+              <div className="coordinate-grid">{(['X', 'Y', 'Z'] as const).map((axis, index) => <label key={axis}><span>{axis}</span><input type="number" step="any" value={selectedPoint.xyz[index]} onChange={event => updateCoordinate(index as 0 | 1 | 2, Number(event.target.value))} /></label>)}</div>
+            </> : selection.length > 1 ? <p className="multi-selection-note">{t('Use the controls or keyboard to move all selected pixels together.', 'Mit den Tasten oder Schaltflächen werden alle ausgewählten Pixel gemeinsam verschoben.')}</p> : <p className="multi-selection-note">{t('Click a pixel in the 3D view to inspect it.', 'Klicke ein Pixel in der 3D-Ansicht an, um es zu bearbeiten.')}</p>}
+            <div className="edit-mode-row"><button className={editMode ? 'active' : ''} onClick={() => setEditMode(value => !value)}>✣ {t('Edit mode', 'Edit-Modus')}</button><label><span>{t('Step', 'Schritt')}</span><input type="number" min="0.0001" step="0.01" value={moveStep} onChange={event => setMoveStep(Math.max(.0001, Number(event.target.value) || .1))} /></label></div>
+            <div className="nudge-grid"><button disabled={!selection.length} onClick={() => moveSelected([-moveStep, 0, 0])}>X−</button><button disabled={!selection.length} onClick={() => moveSelected([moveStep, 0, 0])}>X＋</button><button disabled={!selection.length} onClick={() => moveSelected([0, -moveStep, 0])}>Y−</button><button disabled={!selection.length} onClick={() => moveSelected([0, moveStep, 0])}>Y＋</button><button disabled={!selection.length} onClick={() => moveSelected([0, 0, -moveStep])}>Z−</button><button disabled={!selection.length} onClick={() => moveSelected([0, 0, moveStep])}>Z＋</button></div>
+            <small className="keyboard-hint">{t('Keyboard: arrows move X/Y, Page Up/Down moves Z; Shift = 10×.', 'Tastatur: Pfeile verschieben X/Y, Bild↑/↓ verschiebt Z; Shift = 10×.')}</small>
+            <div className="insert-pixel"><input aria-label={t('Insert at pixel number', 'Bei Pixelnummer einfügen')} type="number" min="1" max={points.length + 1} placeholder={selectedPoint ? String(selectedPoint.sourceIndex + 2) : String(points.length + 1)} value={insertAt} onChange={event => setInsertAt(event.target.value)} /><button disabled={!active} onClick={insertPixel}>＋ {t('Insert pixel', 'Pixel einfügen')}</button></div>
+          </section>
           {stageMode === '3d' ? <div className="fixture-preview">
             <div className="preview-title"><span className="eyebrow">{t('MADMAPPER 2D PREVIEW', 'MADMAPPER 2D-VORSCHAU')}</span><span>{active?.name ?? '—'}</span></div>
-            <FixturePreview language={language} panel={active} points={points} ledSize={settings.ledSize} />
+            <FixturePreview language={language} panel={active} points={points} ledSize={settings.ledSize} showOutputGrid={showOutputGrid} />
             <div className="preview-metrics"><span>{active ? `${active.transform.rotation.toFixed(1)}°` : '—'}</span><span>{active ? `${Math.round(active.transform.scale * 100)} %` : '—'}</span>{active?.transform.flipX && <span>Flip H</span>}{active?.transform.flipY && <span>Flip V</span>}</div>
-            <div className="preview-actions"><button onClick={() => setStageMode('2d')}>⇄ {t('Show large', 'Groß anzeigen')}</button><button onClick={openRepairReview}>◇ Auto Repair</button></div>
+            <div className="preview-actions"><button onClick={() => setStageMode('2d')}>⇄ {t('Show large', 'Groß anzeigen')}</button><button className={showOutputGrid ? 'active' : ''} onClick={() => setShowOutputGrid(value => !value)}>▦ {t('Grid', 'Raster')}</button><button onClick={openRepairReview}>◇ Auto Repair</button></div>
             <p>{t('Best-fit plane · source order is preserved', 'Best-Fit-Ebene · Quellreihenfolge bleibt erhalten')}</p>
           </div> : <div className="fixture-preview swapped-preview">
             <div className="preview-title"><span className="eyebrow">{t('3D ORIENTATION', '3D-ORIENTIERUNG')}</span><span>{viewLabel}</span></div>
-            <div className="mini-map-viewport"><MapCanvas language={language} points={points} panels={panels} selectionMode={false} onSelection={() => undefined} camera={mapCamera} onCameraChange={setMapCamera} /></div>
+            <div className="mini-map-viewport"><MapCanvas language={language} points={points} panels={panels} selectionMode={false} showPixelNumbers={false} selectedIndices={selection} onSelection={() => undefined} camera={mapCamera} onCameraChange={setMapCamera} /></div>
             <div className="preview-actions one"><button onClick={() => setStageMode('3d')}>⇄ {t('Show large 3D', '3D groß anzeigen')}</button></div>
             <p>{t('The camera position is retained when switching views.', 'Die Kameraposition bleibt beim Wechsel erhalten.')}</p>
           </div>}
@@ -745,7 +926,7 @@ export default function Home() {
 
       {showAdjust && active && <div className="modal-backdrop" onMouseDown={() => setShowAdjust(false)}><section className="modal adjust-modal" onMouseDown={event => event.stopPropagation()} aria-modal="true" role="dialog" aria-labelledby="adjust-title">
         <button className="modal-close" aria-label={t('Close', 'Schließen')} onClick={() => setShowAdjust(false)}>×</button><span className="eyebrow">{t('2D ALIGNMENT', '2D-AUSRICHTUNG')}</span><h2 id="adjust-title">{t(`Adjust ${active.name}`, `${active.name} justieren`)}</h2><p className="modal-lead">{t('Drag the panel freely around its centre. Use the mouse wheel to change its export size.', 'Ziehe das Panel frei um seinen Mittelpunkt. Mit dem Mausrad veränderst du seine Exportgröße.')}</p>
-        <div className="adjust-layout"><div className="adjust-preview"><FixturePreview language={language} panel={active} points={points} ledSize={settings.ledSize} interactive onTransform={updatePanelTransform} /><div className="adjust-hint">{t('Drag: rotate · Wheel: scale', 'Ziehen: drehen · Mausrad: skalieren')}</div></div><div className="adjust-controls">
+        <div className="adjust-layout"><div className="adjust-preview"><FixturePreview language={language} panel={active} points={points} ledSize={settings.ledSize} interactive showOutputGrid={showOutputGrid} onTransform={updatePanelTransform} /><div className="adjust-hint">{t('Drag: rotate · Wheel: scale', 'Ziehen: drehen · Mausrad: skalieren')}</div></div><div className="adjust-controls">
           <div className="control-block"><div className="control-title"><span>{t('Rotation', 'Rotation')}</span><output>{active.transform.rotation.toFixed(1)}°</output></div><input type="range" min="-180" max="180" step="0.1" value={active.transform.rotation} onChange={event => updatePanelTransform({ ...active.transform, rotation: Number(event.target.value) })} /><div className="snap-buttons"><button onClick={() => snapActive('horizontal')}>↔ {t('Horizontal', 'Horizontal')}</button><button onClick={() => snapActive('vertical')}>↕ {t('Vertical', 'Vertikal')}</button></div></div>
           <div className="control-block"><div className="control-title"><span>{t('Flip', 'Spiegeln')}</span><output>{active.transform.flipX || active.transform.flipY ? [active.transform.flipX && 'H', active.transform.flipY && 'V'].filter(Boolean).join(' + ') : t('Off', 'Aus')}</output></div><div className="snap-buttons flip-buttons"><button className={active.transform.flipX ? 'active' : ''} onClick={() => flipActive('horizontal')}>⇋ {t('Flip horizontal', 'Horizontal flippen')}</button><button className={active.transform.flipY ? 'active' : ''} onClick={() => flipActive('vertical')}>⇵ {t('Flip vertical', 'Vertikal flippen')}</button></div></div>
           <div className="control-block"><div className="control-title"><span>{t('Export size', 'Exportgröße')}</span><output>{Math.round(active.transform.scale * 100)} %</output></div><div className="scale-control"><button aria-label={t('Decrease size', 'Verkleinern')} onClick={() => updatePanelTransform({ ...active.transform, scale: active.transform.scale - .05 })}>−</button><input type="range" min="0.25" max="4" step="0.01" value={active.transform.scale} onChange={event => updatePanelTransform({ ...active.transform, scale: Number(event.target.value) })} /><button aria-label={t('Increase size', 'Vergrößern')} onClick={() => updatePanelTransform({ ...active.transform, scale: active.transform.scale + .05 })}>＋</button></div><small>{t('Affects preview and exported pixel spacing.', 'Wirkt auf Vorschau und Exportabstände.')}</small></div>
@@ -756,12 +937,13 @@ export default function Home() {
 
       {showRepair && active && <div className="modal-backdrop" onMouseDown={() => setShowRepair(false)}><section className="modal repair-modal" onMouseDown={event => event.stopPropagation()} aria-modal="true" role="dialog" aria-labelledby="repair-title">
         <button className="modal-close" aria-label={t('Close', 'Schließen')} onClick={() => setShowRepair(false)}>×</button><span className="eyebrow">{t('AUTO REPAIR · REVIEW', 'AUTO-REPAIR · VORSCHAU')}</span><h2 id="repair-title">{t('Review measurement errors', 'Messfehler kontrollieren')}</h2><p className="modal-lead">{t('Orange shows the current measurement and green shows the proposed position. Your map changes only after you apply the selected repairs.', 'Orange markiert die bisherige Messung, Grün die vorgeschlagene Position. Erst „Ausgewählte anwenden“ verändert deine Map.')}</p>
-        <div className="repair-toolbar"><label>{t('Sensitivity', 'Prüfstufe')}<select value={repairSensitivity} onChange={event => changeRepairSensitivity(event.target.value as RepairSensitivity)}><option value="conservative">{t('Conservative · recommended', 'Konservativ · empfohlen')}</option><option value="balanced">{t('Balanced', 'Ausgewogen')}</option><option value="sensitive">{t('Sensitive', 'Empfindlich')}</option></select></label><div className="repair-zoom"><button aria-label={t('Zoom out', 'Verkleinern')} onClick={() => setRepairZoom(value => Math.max(1, value - .5))}>−</button><input aria-label={t('Repair preview zoom', 'Zoom der Reparaturvorschau')} type="range" min="1" max="8" step="0.1" value={repairZoom} onChange={event => setRepairZoom(Number(event.target.value))} /><output>{Math.round(repairZoom * 100)} %</output><button aria-label={t('Zoom in', 'Vergrößern')} onClick={() => setRepairZoom(value => Math.min(8, value + .5))}>＋</button></div></div>
+        <div className="repair-toolbar"><label>{t('Deviation threshold', 'Abweichungsschwellwert')}<div className="threshold-control"><input aria-label={t('Deviation threshold in average pixel spacings', 'Abweichungsschwellwert in mittleren Pixelabständen')} type="range" min="0.25" max="4" step="0.05" value={repairThreshold} onChange={event => changeRepairThreshold(Number(event.target.value))} /><output>{repairThreshold.toFixed(2)} ×</output></div></label><div className="repair-zoom"><button aria-label={t('Zoom out', 'Verkleinern')} onClick={() => setRepairZoom(value => Math.max(1, value - .5))}>−</button><input aria-label={t('Repair preview zoom', 'Zoom der Reparaturvorschau')} type="range" min="1" max="8" step="0.1" value={repairZoom} onChange={event => setRepairZoom(Number(event.target.value))} /><output>{Math.round(repairZoom * 100)} %</output><button aria-label={t('Zoom in', 'Vergrößern')} onClick={() => setRepairZoom(value => Math.min(8, value + .5))}>＋</button></div></div>
+        {repairModel && <div className="matrix-summary"><span>{t('Detected matrix', 'Erkannte Matrix')}: <b>{repairModel.rowLength}</b> {t('pixels per row', 'Pixel pro Zeile')}</span><span>{repairModel.serpentine ? t('Zigzag wiring', 'Zickzack-Verkabelung') : t('Raster wiring', 'Raster-Verkabelung')}</span><span>{t('Average spacing', 'Mittlerer Abstand')}: <b>{repairModel.averagePitch.toFixed(3)}</b></span></div>}
         <RepairPreview language={language} key={active.id} panel={active} points={points} suggestions={repairSuggestions} zoom={repairZoom} onZoomChange={setRepairZoom} />
         <div className="repair-pan-hint">{t('Drag: pan · Wheel: zoom · Double-click: centre', 'Ziehen: Ausschnitt verschieben · Mausrad: zoomen · Doppelklick: zentrieren')}</div>
         <div className="repair-legend"><span><i className="original" /> {t('Original', 'Original')}</span><span><i className="proposed" /> {t('Proposed', 'Vorschlag')}</span><span>{selectedRepairCount}/{repairSuggestions.length} {t('selected', 'ausgewählt')}</span></div>
-        <div className="repair-list">{repairSuggestions.length ? repairSuggestions.map(suggestion => <label className={`repair-row ${suggestion.selected ? 'selected' : ''}`} key={suggestion.id}><input type="checkbox" checked={suggestion.selected} onChange={() => setRepairSuggestions(items => items.map(item => item.id === suggestion.id ? { ...item, selected: !item.selected } : item))} /><span className="repair-index">#{suggestion.sourceIndex + 1}</span><span className="repair-copy"><strong>{repairReason(suggestion.reason)}</strong><small>{suggestion.before.map(value => value.toFixed(2)).join(' / ')} → {suggestion.after.map(value => value.toFixed(2)).join(' / ')}</small></span><span className={`confidence ${suggestion.confidence}`}>{confidenceLabel(suggestion.confidence)}</span></label>) : <div className="repair-empty">{t('No clear measurement errors were found at this sensitivity.', 'Mit dieser Prüfstufe wurden keine eindeutigen Messfehler gefunden.')}</div>}</div>
-        <div className="repair-note">{t('“Conservative” only considers clearly bracketed gaps and strong deviations with enough supporting data. Use “Balanced” for borderline cases.', '„Konservativ“ berücksichtigt nur klar eingerahmte Lücken und starke Abweichungen mit ausreichender Sicherheit. Für Grenzfälle kannst du gezielt auf „Ausgewogen“ wechseln.')}</div>
+        <div className="repair-list">{repairSuggestions.length ? repairSuggestions.map(suggestion => <label className={`repair-row ${suggestion.selected ? 'selected' : ''}`} key={suggestion.id}><input type="checkbox" checked={suggestion.selected} onChange={() => setRepairSuggestions(items => items.map(item => item.id === suggestion.id ? { ...item, selected: !item.selected } : item))} /><span className="repair-index">#{suggestion.sourceIndex + 1}</span><span className="repair-copy"><strong>{repairReason(suggestion.reason)}</strong><small>{suggestion.before.map(value => value.toFixed(2)).join(' / ')} → {suggestion.after.map(value => value.toFixed(2)).join(' / ')} · {Number.isFinite(suggestion.deviationRatio) ? `${suggestion.deviationRatio.toFixed(2)} ×` : '∞'} · {suggestion.supportCount}/8</small></span><span className={`confidence ${suggestion.confidence}`}>{confidenceLabel(suggestion.confidence)}</span></label>) : <div className="repair-empty">{t('No pixel exceeds the selected deviation threshold.', 'Kein Pixel überschreitet den gewählten Abweichungsschwellwert.')}</div>}</div>
+        <div className="repair-note">{t('The expected position combines the panel-wide average spacing and detected matrix/zigzag pattern with residuals from up to four previous and four following pixels. Row changes are predicted as row changes, not treated as errors.', 'Die erwartete Position kombiniert den mittleren Abstand der gesamten Messung und das erkannte Matrix-/Zickzack-Muster mit Restabweichungen von bis zu vier vorherigen und vier nachfolgenden Pixeln. Zeilenwechsel werden als solche berechnet und nicht als Fehler gewertet.')}</div>
         <div className="modal-actions"><button className="secondary-button" onClick={() => { setShowRepair(false); setRepairSuggestions([]); setMessage(t('Repair suggestions discarded — original data unchanged.', 'Reparaturvorschläge verworfen — Originaldaten unverändert.')); }}>{t('Cancel', 'Abbrechen')}</button><button className="primary-button repair-apply" disabled={!selectedRepairCount} onClick={applyRepairs}>{t(`Apply ${selectedRepairCount} selected`, `${selectedRepairCount} ausgewählte anwenden`)}</button></div>
       </section></div>}
 

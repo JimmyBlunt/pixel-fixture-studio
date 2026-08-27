@@ -15,10 +15,12 @@ The hosted app currently uses access-controlled Sites hosting. Everyone can run 
 ## Highlights
 
 - Pixelblaze JSON and Marimapper 2D/3D CSV import
-- Interactive 3D orbit, zoom, orthographic views, and box selection
+- Interactive 3D orbit, zoom, orthographic views, optional pixel numbers, click and box selection
+- Pixel editor with coordinate entry, multi-pixel keyboard nudging, search, and insertion
 - Automatic spatial panel detection with per-panel enable/disable controls
 - Large 2D alignment workspace with free rotation, axis snap, scaling, and horizontal/vertical flip
-- Conservative, balanced, and sensitive measurement repair with before/after review
+- Matrix- and zigzag-aware repair suggestions with an adjustable deviation threshold and before/after review
+- Optional transparent MMFL cell grid in every 2D preview, including empty output cells
 - MadMapper 6.1 SVG, CSV, and experimental MMFL exports
 - English default interface with instant German translation
 - Local-first processing: map files never leave the browser
@@ -31,13 +33,15 @@ Open the [hosted app](https://pixel-fixture-studio.jimmyblunt44.chatgpt.site/) (
 
 ### 2. Select and align
 
-Choose a detected panel or draw a box around LEDs to create a custom panel. Swap the large workspace to 2D to rotate, snap, scale, or flip the fixture before export.
+Choose a detected panel or draw a box around LEDs to create a custom panel. Click a pixel to inspect and edit its X/Y/Z values, search by its one-based pixel number, or enable Edit Mode to move a selection with the arrow keys. `Page Up`/`Page Down` move Z and `Shift` uses a 10× step. New pixels can be inserted into the active panel; following source numbers shift forward.
+
+Swap the large workspace to 2D to rotate, snap, scale, or flip the fixture before export. Enable the MMFL grid to see the exact quantised cells, including empty cells, that the MMFL export will contain.
 
 ![Large MadMapper-style 2D alignment view](docs/images/02-2d-alignment.png)
 
 ### 3. Review repairs
 
-Auto Repair only prepares suggestions. Proposed positions remain visually distinct until explicitly selected and applied, leaving the original measurements untouched during review.
+Auto Repair only prepares suggestions. The algorithm learns the panel-wide average pitch, row length, and raster or zigzag direction, then combines that model with up to four measured neighbours before and after each pixel. Only deviations above the chosen multiple of average spacing are proposed. Row changes are modelled explicitly. Proposed positions remain visually distinct until explicitly selected and applied, leaving the original measurements untouched during review.
 
 ![Auto Repair review with sensitivity and zoom controls](docs/images/03-auto-repair.png)
 
