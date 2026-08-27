@@ -4,7 +4,7 @@ import { ChangeEvent, PointerEvent as ReactPointerEvent, useEffect, useMemo, use
 
 type Vec3 = [number, number, number];
 type Language = 'en' | 'de';
-type MapPoint = { sourceIndex: number; xyz: Vec3; status: 'ok' | 'placeholder' | 'outlier' };
+type MapPoint = { sourceIndex: number; xyz: Vec3; status: 'ok' | 'inferred' | 'placeholder' | 'outlier' };
 type PanelTransform = { rotation: number; scale: number; flipX: boolean; flipY: boolean };
 type Panel = { id: string; name: string; indices: number[]; color: string; enabled: boolean; transform: PanelTransform };
 type Camera = { yaw: number; pitch: number; zoom: number };
@@ -101,16 +101,20 @@ function parseMarimapperCsv(text: string, language: Language): ParsedMap {
   if (!is3d && !is2d) throw new Error(translated(language, 'Unknown CSV structure. Expected Marimapper index,x,y,z,xn,yn,zn,error or index,u,v.', 'Unbekannte CSV-Struktur. Marimapper erwartet index,x,y,z,xn,yn,zn,error oder index,u,v.'));
 
   const measured = new Map<number, Vec3>();
+  const declaredIndices = new Set<number>();
   lines.slice(1).forEach((line, rowIndex) => {
     const values = line.split(',').map(value => value.trim());
     const index = Number(values[column('index')]);
-    const xyz = is3d ? [Number(values[column('x')]), Number(values[column('y')]), Number(values[column('z')])] : [Number(values[column('u')]), Number(values[column('v')]), 0];
-    if (!Number.isInteger(index) || index < 0 || !xyz.every(Number.isFinite)) throw new Error(translated(language, `Marimapper row ${rowIndex + 2} contains an invalid index or coordinates.`, `Marimapper-Zeile ${rowIndex + 2} enthält ungültige Index- oder Koordinatenwerte.`));
-    if (measured.has(index)) throw new Error(translated(language, `Marimapper index ${index} occurs more than once.`, `Der Marimapper-Index ${index} kommt mehrfach vor.`));
-    measured.set(index, xyz as Vec3);
+    if (!Number.isInteger(index) || index < 0) throw new Error(translated(language, `Marimapper row ${rowIndex + 2} contains an invalid index.`, `Marimapper-Zeile ${rowIndex + 2} enthält einen ungültigen Index.`));
+    if (declaredIndices.has(index)) throw new Error(translated(language, `Marimapper index ${index} occurs more than once.`, `Der Marimapper-Index ${index} kommt mehrfach vor.`));
+    declaredIndices.add(index);
+    const read = (name: string) => { const raw = values[column(name)]; return raw === '' || raw === undefined ? NaN : Number(raw); };
+    const xyz = is3d ? [read('x'), read('y'), read('z')] : [read('u'), read('v'), 0];
+    // A valid index without finite coordinates is a missing scan, not a fatal CSV error.
+    if (xyz.every(Number.isFinite)) measured.set(index, xyz as Vec3);
   });
   if (!measured.size) throw new Error(translated(language, 'The Marimapper CSV does not contain valid LEDs.', 'Die Marimapper-CSV enthält keine gültigen LEDs.'));
-  const maxIndex = Math.max(...measured.keys());
+  const maxIndex = Math.max(...declaredIndices);
   if (maxIndex >= 20000) throw new Error(translated(language, 'The interactive preview supports up to 20,000 LED slots.', 'Für die interaktive Vorschau sind maximal 20.000 LED-Slots vorgesehen.'));
   const coords = Array.from({ length: maxIndex + 1 }, (_, index) => measured.get(index) ?? [0, 0, 0] as Vec3);
   const missingIndices = new Set(coords.map((_, index) => index).filter(index => !measured.has(index)));
@@ -296,26 +300,64 @@ function estimateExpectedPosition(sourceIndex: number, panel: Panel, points: Map
     const span = after[0].sourceIndex - before[0].sourceIndex;
     candidates.push(add(before[0].xyz, scaleVec(sub(after[0].xyz, before[0].xyz), (sourceIndex - before[0].sourceIndex) / Math.max(span, 1))));
   }
-  if (before[0] && before[1]) candidates.push(add(before[0].xyz, scaleVec(sub(before[0].xyz, before[1].xyz), sourceIndex - before[0].sourceIndex)));
-  if (after[0] && after[1]) candidates.push(sub(after[0].xyz, scaleVec(sub(after[1].xyz, after[0].xyz), after[0].sourceIndex - sourceIndex)));
+  if (before[0] && before[1]) {
+    const step = scaleVec(sub(before[0].xyz, before[1].xyz), 1 / Math.max(before[0].sourceIndex - before[1].sourceIndex, 1));
+    candidates.push(add(before[0].xyz, scaleVec(step, sourceIndex - before[0].sourceIndex)));
+  }
+  if (after[0] && after[1]) {
+    const step = scaleVec(sub(after[1].xyz, after[0].xyz), 1 / Math.max(after[1].sourceIndex - after[0].sourceIndex, 1));
+    candidates.push(sub(after[0].xyz, scaleVec(step, after[0].sourceIndex - sourceIndex)));
+  }
   return candidates.length ? { position: averageVec(candidates), supportCount: neighbours.length, model: null } : null;
 }
 
 /** Suggest only points whose deviation exceeds the user-defined multiple of average LED spacing. */
-function findRepairSuggestions(panel: Panel, points: MapPoint[], pitch: number, threshold: number): RepairSuggestion[] {
+function findRepairSuggestions(panel: Panel, points: MapPoint[], pitch: number, threshold: number, includeMeasured = false): RepairSuggestion[] {
   if (!panel.indices.length) return [];
   const model = buildMatrixModel(panel, points, pitch);
   const sorted = [...panel.indices].sort((a, b) => a - b);
   const minIndex = sorted[0], maxIndex = sorted[sorted.length - 1];
   return points.slice(minIndex, maxIndex + 1).flatMap(point => {
+    const isMissing = point.status === 'placeholder';
+    if (point.status === 'inferred' || (!isMissing && !includeMeasured)) return [];
     const estimate = estimateExpectedPosition(point.sourceIndex, panel, points, pitch, model);
     if (!estimate || estimate.supportCount < 2) return [];
     const averagePitch = model?.averagePitch ?? pitch;
-    const deviationRatio = point.status === 'placeholder' ? Infinity : dist(point.xyz, estimate.position) / Math.max(averagePitch, .0001);
+    const deviationRatio = isMissing ? Infinity : dist(point.xyz, estimate.position) / Math.max(averagePitch, .0001);
     if (deviationRatio <= threshold) return [];
     const confidence: RepairSuggestion['confidence'] = estimate.supportCount >= 6 && model ? 'high' : estimate.supportCount >= 4 ? 'medium' : 'low';
-    return [{ id: `repair-${point.sourceIndex}`, sourceIndex: point.sourceIndex, before: point.xyz, after: estimate.position, reason: point.status === 'placeholder' ? 'missing-reading' : 'threshold-deviation', confidence, deviationRatio, supportCount: estimate.supportCount, selected: confidence !== 'low' }];
+    return [{ id: `repair-${point.sourceIndex}`, sourceIndex: point.sourceIndex, before: point.xyz, after: estimate.position, reason: isMissing ? 'missing-reading' : 'threshold-deviation', confidence, deviationRatio, supportCount: estimate.supportCount, selected: confidence !== 'low' }];
   });
+}
+
+/** Automatically place sparse CSV slots without allowing inferred points to train the model. */
+function placeMissingCoordinates(points: MapPoint[], panels: Panel[], pitch: number, missingIndices: Set<number>) {
+  const placedPoints = points.map(point => ({ ...point, xyz: [...point.xyz] as Vec3 }));
+  const placedPanels = panels.map(panel => ({ ...panel, indices: [...panel.indices] }));
+  let placed = 0;
+
+  [...missingIndices].sort((a, b) => a - b).forEach(sourceIndex => {
+    const point = placedPoints[sourceIndex];
+    if (!point || !placedPanels.length) return;
+    const panel = [...placedPanels].sort((a, b) => {
+      const distanceToRange = (candidate: Panel) => {
+        const first = candidate.indices[0] ?? Infinity, last = candidate.indices.at(-1) ?? -Infinity;
+        return sourceIndex < first ? first - sourceIndex : sourceIndex > last ? sourceIndex - last : 0;
+      };
+      return distanceToRange(a) - distanceToRange(b);
+    })[0];
+    if (!panel?.indices.length) return;
+    const model = buildMatrixModel(panel, placedPoints, pitch);
+    const estimate = estimateExpectedPosition(sourceIndex, panel, placedPoints, pitch, model);
+    const position = estimate?.position ?? model?.positionAt(sourceIndex);
+    if (!position || !position.every(Number.isFinite)) return;
+    point.xyz = position;
+    point.status = 'inferred';
+    panel.indices = [...new Set([...panel.indices, sourceIndex])].sort((a, b) => a - b);
+    placed += 1;
+  });
+
+  return { points: placedPoints, panels: placedPanels, placed, unresolved: missingIndices.size - placed };
 }
 
 function xmlEscape(value: string) { return value.replace(/[<>&"']/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;', "'": '&apos;' }[c] ?? c)); }
@@ -449,7 +491,7 @@ function MapCanvas({ points, panels, selectionMode, showPixelNumbers, selectedIn
       ctx.globalAlpha = 1; ctx.shadowBlur = 0;
       points.filter(p => p.status !== 'ok').forEach(p => {
         const visiblePoint = projectedRef.current.find(q => q.index === p.sourceIndex); if (!visiblePoint) return;
-        ctx.strokeStyle = p.status === 'outlier' ? '#ffb454' : '#5f6a80'; ctx.strokeRect(visiblePoint.x - 3, visiblePoint.y - 3, 6, 6);
+        ctx.strokeStyle = p.status === 'outlier' ? '#ffb454' : p.status === 'inferred' ? '#49dcb3' : '#5f6a80'; ctx.strokeRect(visiblePoint.x - 4, visiblePoint.y - 4, 8, 8);
       });
       if (box) { ctx.fillStyle = 'rgba(255,79,135,.12)'; ctx.strokeStyle = '#ff4f87'; ctx.setLineDash([5, 4]); ctx.fillRect(box.x1, box.y1, box.x2 - box.x1, box.y2 - box.y1); ctx.strokeRect(box.x1, box.y1, box.x2 - box.x1, box.y2 - box.y1); ctx.setLineDash([]); }
     };
@@ -622,7 +664,8 @@ export default function Home() {
   const [showAdjust, setShowAdjust] = useState(false);
   const [showRepair, setShowRepair] = useState(false);
   const [repairSuggestions, setRepairSuggestions] = useState<RepairSuggestion[]>([]);
-  const [repairThreshold, setRepairThreshold] = useState(1.25);
+  const [repairThreshold, setRepairThreshold] = useState(2.5);
+  const [includeMeasuredRepairs, setIncludeMeasuredRepairs] = useState(false);
   const [repairZoom, setRepairZoom] = useState(1);
   const [settings, setSettings] = useState<ExportSettings>({ universe: 0, channel: 1, channels: 3, ledSize: 6, definition: 'Generic - Pixel RGB' });
   const inputRef = useRef<HTMLInputElement>(null);
@@ -631,7 +674,9 @@ export default function Home() {
   const active = panels.find(panel => panel.id === activeId) ?? panels[0];
   const enabledPanels = panels.filter(panel => panel.enabled);
   const placeholders = points.filter(point => point.status === 'placeholder').length;
+  const inferred = points.filter(point => point.status === 'inferred').length;
   const outliers = points.filter(point => point.status === 'outlier').length;
+  const reviewWarnings = placeholders + (includeMeasuredRepairs ? outliers : 0);
   const selectedRepairCount = repairSuggestions.filter(suggestion => suggestion.selected).length;
   const selectedPoint = selection.length === 1 ? points[selection[0]] : undefined;
   const repairModel = useMemo(() => active ? buildMatrixModel(active, points, pitch) : null, [active, points, pitch]);
@@ -675,12 +720,13 @@ export default function Home() {
         : { coords: extractCoordinates(JSON.parse(text), language), missingIndices: new Set<number>(), sourceLabel: 'Pixelblaze JSON', measuredCount: 0 };
       const coords = parsed.coords;
       if (coords.length > 20000) throw new Error(t('The interactive preview supports up to 20,000 LEDs.', 'Für die interaktive Vorschau sind maximal 20.000 LEDs vorgesehen.'));
-      const result = analyze(coords, parsed.missingIndices);
-      if (!result.panels.length) throw new Error(t('No connected LED regions were detected. Use a clean scan or select points manually.', 'Keine zusammenhängenden LED-Bereiche erkannt. Nutze eine sauber gescannte Map oder wähle Punkte manuell.'));
-      setPoints(result.points);
-      setPanels(result.panels);
-      setActiveId(result.panels[0].id);
-      setPitch(result.pitch);
+      const analyzed = analyze(coords, parsed.missingIndices);
+      if (!analyzed.panels.length) throw new Error(t('No connected LED regions were detected. Use a clean scan or select points manually.', 'Keine zusammenhängenden LED-Bereiche erkannt. Nutze eine sauber gescannte Map oder wähle Punkte manuell.'));
+      const recovered = parsed.missingIndices.size ? placeMissingCoordinates(analyzed.points, analyzed.panels, analyzed.pitch, parsed.missingIndices) : { points: analyzed.points, panels: analyzed.panels, placed: 0, unresolved: 0 };
+      setPoints(recovered.points);
+      setPanels(recovered.panels);
+      setActiveId(recovered.panels[0].id);
+      setPitch(analyzed.pitch);
       setFileName(file.name);
       setSelection([]);
       setPixelSearch('');
@@ -690,11 +736,12 @@ export default function Home() {
       setShowRepair(false);
       setShowAdjust(false);
       setStageMode('3d');
+      setIncludeMeasuredRepairs(false);
       setError('');
-      const gapInfo = parsed.missingIndices.size ? t(` · ${parsed.missingIndices.size} missing indices preserved as placeholders`, ` · ${parsed.missingIndices.size} fehlende Indizes als Platzhalter`) : '';
+      const gapInfo = parsed.missingIndices.size ? t(` · ${recovered.placed} missing indices positioned automatically${recovered.unresolved ? ` · ${recovered.unresolved} unresolved` : ''}`, ` · ${recovered.placed} fehlende Indizes automatisch positioniert${recovered.unresolved ? ` · ${recovered.unresolved} ungelöst` : ''}`) : '';
       setMessage(t(
-        `${parsed.sourceLabel}: ${numberFormat.format(coords.length)} slots loaded · ${result.panels.length} panels detected${gapInfo}.`,
-        `${parsed.sourceLabel}: ${numberFormat.format(coords.length)} Slots geladen · ${result.panels.length} Panels erkannt${gapInfo}.`,
+        `${parsed.sourceLabel}: ${numberFormat.format(coords.length)} slots loaded · ${recovered.panels.length} panels detected${gapInfo}.`,
+        `${parsed.sourceLabel}: ${numberFormat.format(coords.length)} Slots geladen · ${recovered.panels.length} Panels erkannt${gapInfo}.`,
       ));
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : t('The file could not be read.', 'Die Datei konnte nicht gelesen werden.'));
@@ -779,20 +826,27 @@ export default function Home() {
   };
   const openRepairReview = () => {
     if (!active) return;
-    const suggestions = findRepairSuggestions(active, points, pitch, repairThreshold);
+    const suggestions = findRepairSuggestions(active, points, pitch, repairThreshold, includeMeasuredRepairs);
     setRepairSuggestions(suggestions);
     setRepairZoom(1);
     setShowRepair(true);
     setMessage(suggestions.length
       ? t(`${suggestions.length} possible measurement errors found in ${active.name} — no data has been changed.`, `${suggestions.length} mögliche Messfehler in ${active.name} gefunden — noch nichts verändert.`)
-      : t(`${active.name}: no pixel exceeds ${repairThreshold.toFixed(2)} × average spacing.`, `${active.name}: kein Pixel überschreitet ${repairThreshold.toFixed(2)} × mittleren Abstand.`));
+      : includeMeasuredRepairs ? t(`${active.name}: no measured pixel exceeds ${repairThreshold.toFixed(2)} × average spacing.`, `${active.name}: kein gemessenes Pixel überschreitet ${repairThreshold.toFixed(2)} × mittleren Abstand.`) : t(`${active.name}: no unresolved missing pixels. Measured coordinates remain protected.`, `${active.name}: keine ungelösten fehlenden Pixel. Gemessene Koordinaten bleiben geschützt.`));
   };
   const changeRepairThreshold = (next: number) => {
     setRepairThreshold(next);
     if (!active) return;
-    const suggestions = findRepairSuggestions(active, points, pitch, next);
+    const suggestions = findRepairSuggestions(active, points, pitch, next, includeMeasuredRepairs);
     setRepairSuggestions(suggestions);
     setMessage(t(`${suggestions.length} suggestion${suggestions.length === 1 ? '' : 's'} above ${next.toFixed(2)} × spacing.`, `${suggestions.length} Vorschlag${suggestions.length === 1 ? '' : 'e'} über ${next.toFixed(2)} × Abstand.`));
+  };
+  const changeMeasuredRepairMode = (next: boolean) => {
+    setIncludeMeasuredRepairs(next);
+    if (!active) return;
+    const suggestions = findRepairSuggestions(active, points, pitch, repairThreshold, next);
+    setRepairSuggestions(suggestions);
+    setMessage(next ? t('Measured outlier review enabled. No coordinates change without confirmation.', 'Prüfung gemessener Ausreißer aktiviert. Ohne Bestätigung werden keine Koordinaten verändert.') : t('Measured coordinates protected; only unresolved missing pixels are reviewed.', 'Gemessene Koordinaten geschützt; geprüft werden nur ungelöste fehlende Pixel.'));
   };
   const applyRepairs = () => {
     if (!active) return;
@@ -889,7 +943,7 @@ export default function Home() {
               <div className="canvas-help">{t('Drag: rotate · Wheel: export size', 'Ziehen: drehen · Mausrad: Exportgröße')}</div>
             </>}
           </div>
-          <div className="stage-footer"><span><b>{numberFormat.format(points.length)}</b> Slots</span><span><b>{panels.length}</b> {t('regions', 'Bereiche')}</span><button className={`warning-button ${placeholders + outliers ? 'warning' : ''}`} onClick={openRepairReview}><b>{placeholders + outliers}</b> {t('review warnings', 'Warnungen prüfen')}</button><span className="status-message">{message}</span></div>
+          <div className="stage-footer"><span><b>{numberFormat.format(points.length)}</b> Slots</span><span><b>{panels.length}</b> {t('regions', 'Bereiche')}</span>{inferred > 0 && <span className="inferred-count"><b>{inferred}</b> {t('auto-positioned', 'automatisch positioniert')}</span>}<button className={`warning-button ${reviewWarnings ? 'warning' : ''}`} onClick={openRepairReview}><b>{reviewWarnings}</b> {t('review warnings', 'Warnungen prüfen')}</button><span className="status-message">{message}</span></div>
         </section>
 
         <aside className="rail right-rail">
@@ -937,14 +991,15 @@ export default function Home() {
       </section></div>}
 
       {showRepair && active && <div className="modal-backdrop" onMouseDown={() => setShowRepair(false)}><section className="modal repair-modal" onMouseDown={event => event.stopPropagation()} aria-modal="true" role="dialog" aria-labelledby="repair-title">
-        <button className="modal-close" aria-label={t('Close', 'Schließen')} onClick={() => setShowRepair(false)}>×</button><span className="eyebrow">{t('AUTO REPAIR · REVIEW', 'AUTO-REPAIR · VORSCHAU')}</span><h2 id="repair-title">{t('Review measurement errors', 'Messfehler kontrollieren')}</h2><p className="modal-lead">{t('Orange shows the current measurement and green shows the proposed position. Your map changes only after you apply the selected repairs.', 'Orange markiert die bisherige Messung, Grün die vorgeschlagene Position. Erst „Ausgewählte anwenden“ verändert deine Map.')}</p>
-        <div className="repair-toolbar"><label>{t('Deviation threshold', 'Abweichungsschwellwert')}<div className="threshold-control"><input aria-label={t('Deviation threshold in average pixel spacings', 'Abweichungsschwellwert in mittleren Pixelabständen')} type="range" min="0.25" max="4" step="0.05" value={repairThreshold} onChange={event => changeRepairThreshold(Number(event.target.value))} /><output>{repairThreshold.toFixed(2)} ×</output></div></label><div className="repair-zoom"><button aria-label={t('Zoom out', 'Verkleinern')} onClick={() => setRepairZoom(value => Math.max(1, value - .5))}>−</button><input aria-label={t('Repair preview zoom', 'Zoom der Reparaturvorschau')} type="range" min="1" max="8" step="0.1" value={repairZoom} onChange={event => setRepairZoom(Number(event.target.value))} /><output>{Math.round(repairZoom * 100)} %</output><button aria-label={t('Zoom in', 'Vergrößern')} onClick={() => setRepairZoom(value => Math.min(8, value + .5))}>＋</button></div></div>
+        <button className="modal-close" aria-label={t('Close', 'Schließen')} onClick={() => setShowRepair(false)}>×</button><span className="eyebrow">{t('AUTO REPAIR · REVIEW', 'AUTO-REPAIR · VORSCHAU')}</span><h2 id="repair-title">{t('Review unresolved pixels', 'Ungelöste Pixel kontrollieren')}</h2><p className="modal-lead">{t('Missing CSV pixels are positioned automatically during import and marked in turquoise. Measured coordinates are protected unless you explicitly include them below.', 'Fehlende CSV-Pixel werden bereits beim Import automatisch positioniert und türkis markiert. Gemessene Koordinaten sind geschützt, solange du sie unten nicht ausdrücklich einbeziehst.')}</p>
+        <div className="repair-protection"><label><input type="checkbox" checked={includeMeasuredRepairs} onChange={event => changeMeasuredRepairMode(event.target.checked)} /><span><strong>{t('Include measured outliers', 'Gemessene Ausreißer einbeziehen')}</strong><small>{t('Off by default. Enabling this can propose changes to scanned coordinates, but still requires confirmation.', 'Standardmäßig aus. Aktivieren kann Änderungen an gemessenen Koordinaten vorschlagen; jede Änderung muss weiterhin bestätigt werden.')}</small></span></label></div>
+        <div className="repair-toolbar"><label className={!includeMeasuredRepairs ? 'disabled-control' : ''}>{t('Deviation threshold for measured pixels', 'Abweichungsschwellwert für gemessene Pixel')}<div className="threshold-control"><input disabled={!includeMeasuredRepairs} aria-label={t('Deviation threshold in average pixel spacings', 'Abweichungsschwellwert in mittleren Pixelabständen')} type="range" min="1" max="6" step="0.1" value={repairThreshold} onChange={event => changeRepairThreshold(Number(event.target.value))} /><output>{repairThreshold.toFixed(1)} ×</output></div></label><div className="repair-zoom"><button aria-label={t('Zoom out', 'Verkleinern')} onClick={() => setRepairZoom(value => Math.max(1, value - .5))}>−</button><input aria-label={t('Repair preview zoom', 'Zoom der Reparaturvorschau')} type="range" min="1" max="8" step="0.1" value={repairZoom} onChange={event => setRepairZoom(Number(event.target.value))} /><output>{Math.round(repairZoom * 100)} %</output><button aria-label={t('Zoom in', 'Vergrößern')} onClick={() => setRepairZoom(value => Math.min(8, value + .5))}>＋</button></div></div>
         {repairModel && <div className="matrix-summary"><span>{t('Detected matrix', 'Erkannte Matrix')}: <b>{repairModel.rowLength}</b> {t('pixels per row', 'Pixel pro Zeile')}</span><span>{repairModel.serpentine ? t('Zigzag wiring', 'Zickzack-Verkabelung') : t('Raster wiring', 'Raster-Verkabelung')}</span><span>{t('Average spacing', 'Mittlerer Abstand')}: <b>{repairModel.averagePitch.toFixed(3)}</b></span></div>}
         <RepairPreview language={language} key={active.id} panel={active} points={points} suggestions={repairSuggestions} zoom={repairZoom} onZoomChange={setRepairZoom} />
         <div className="repair-pan-hint">{t('Drag: pan · Wheel: zoom · Double-click: centre', 'Ziehen: Ausschnitt verschieben · Mausrad: zoomen · Doppelklick: zentrieren')}</div>
         <div className="repair-legend"><span><i className="original" /> {t('Original', 'Original')}</span><span><i className="proposed" /> {t('Proposed', 'Vorschlag')}</span><span>{selectedRepairCount}/{repairSuggestions.length} {t('selected', 'ausgewählt')}</span></div>
-        <div className="repair-list">{repairSuggestions.length ? repairSuggestions.map(suggestion => <label className={`repair-row ${suggestion.selected ? 'selected' : ''}`} key={suggestion.id}><input type="checkbox" checked={suggestion.selected} onChange={() => setRepairSuggestions(items => items.map(item => item.id === suggestion.id ? { ...item, selected: !item.selected } : item))} /><span className="repair-index">#{suggestion.sourceIndex + 1}</span><span className="repair-copy"><strong>{repairReason(suggestion.reason)}</strong><small>{suggestion.before.map(value => value.toFixed(2)).join(' / ')} → {suggestion.after.map(value => value.toFixed(2)).join(' / ')} · {Number.isFinite(suggestion.deviationRatio) ? `${suggestion.deviationRatio.toFixed(2)} ×` : '∞'} · {suggestion.supportCount}/8</small></span><span className={`confidence ${suggestion.confidence}`}>{confidenceLabel(suggestion.confidence)}</span></label>) : <div className="repair-empty">{t('No pixel exceeds the selected deviation threshold.', 'Kein Pixel überschreitet den gewählten Abweichungsschwellwert.')}</div>}</div>
-        <div className="repair-note">{t('The expected position combines the panel-wide average spacing and detected matrix/zigzag pattern with residuals from up to four previous and four following pixels. Row changes are predicted as row changes, not treated as errors.', 'Die erwartete Position kombiniert den mittleren Abstand der gesamten Messung und das erkannte Matrix-/Zickzack-Muster mit Restabweichungen von bis zu vier vorherigen und vier nachfolgenden Pixeln. Zeilenwechsel werden als solche berechnet und nicht als Fehler gewertet.')}</div>
+        <div className="repair-list">{repairSuggestions.length ? repairSuggestions.map(suggestion => <label className={`repair-row ${suggestion.selected ? 'selected' : ''}`} key={suggestion.id}><input type="checkbox" checked={suggestion.selected} onChange={() => setRepairSuggestions(items => items.map(item => item.id === suggestion.id ? { ...item, selected: !item.selected } : item))} /><span className="repair-index">#{suggestion.sourceIndex + 1}</span><span className="repair-copy"><strong>{repairReason(suggestion.reason)}</strong><small>{suggestion.before.map(value => value.toFixed(2)).join(' / ')} → {suggestion.after.map(value => value.toFixed(2)).join(' / ')} · {Number.isFinite(suggestion.deviationRatio) ? `${suggestion.deviationRatio.toFixed(2)} ×` : '∞'} · {suggestion.supportCount}/8</small></span><span className={`confidence ${suggestion.confidence}`}>{confidenceLabel(suggestion.confidence)}</span></label>) : <div className="repair-empty">{includeMeasuredRepairs ? t('No measured pixel exceeds the selected threshold.', 'Kein gemessenes Pixel überschreitet den gewählten Schwellwert.') : t('All missing CSV pixels that could be calculated were already positioned automatically. Measured coordinates remain unchanged.', 'Alle berechenbaren fehlenden CSV-Pixel wurden bereits automatisch positioniert. Gemessene Koordinaten bleiben unverändert.')}</div>}</div>
+        <div className="repair-note">{t('Automatic CSV placement combines panel-wide average spacing and the detected matrix/zigzag pattern with up to four previous and four following measured pixels. Inferred pixels never train the model and can be adjusted manually in the Pixel Editor.', 'Die automatische CSV-Platzierung kombiniert den mittleren Abstand des Panels und das erkannte Matrix-/Zickzack-Muster mit bis zu vier vorherigen und vier nachfolgenden gemessenen Pixeln. Berechnete Pixel trainieren das Modell niemals und können im Pixel-Editor manuell angepasst werden.')}</div>
         <div className="modal-actions"><button className="secondary-button" onClick={() => { setShowRepair(false); setRepairSuggestions([]); setMessage(t('Repair suggestions discarded — original data unchanged.', 'Reparaturvorschläge verworfen — Originaldaten unverändert.')); }}>{t('Cancel', 'Abbrechen')}</button><button className="primary-button repair-apply" disabled={!selectedRepairCount} onClick={applyRepairs}>{t(`Apply ${selectedRepairCount} selected`, `${selectedRepairCount} ausgewählte anwenden`)}</button></div>
       </section></div>}
 
@@ -958,7 +1013,7 @@ export default function Home() {
 
       {showHelp && <div className="modal-backdrop" onMouseDown={() => setShowHelp(false)}><section className="modal help-modal" onMouseDown={event => event.stopPropagation()} aria-modal="true" role="dialog" aria-labelledby="help-title">
         <button className="modal-close" aria-label={t('Close', 'Schließen')} onClick={() => setShowHelp(false)}>×</button><span className="eyebrow">{t('FORMAT HELP', 'FORMAT-HILFE')}</span><h2 id="help-title">{t('Which format should I use?', 'Welches Format wofür?')}</h2>
-        <div className="help-row"><b>Import</b><p>{t('Pixelblaze JSON, Marimapper 3D CSV ', 'Pixelblaze-JSON sowie Marimapper-3D-CSV ')}(<code>index,x,y,z,xn,yn,zn,error</code>) {t('and 2D CSV ', 'und 2D-CSV ')}(<code>index,u,v</code>). {t('Missing Marimapper indices remain available as repairable slots.', 'Fehlende Marimapper-Indizes bleiben als reparierbare Slots erhalten.')}</p></div>
+        <div className="help-row"><b>Import</b><p>{t('Pixelblaze JSON, Marimapper 3D CSV ', 'Pixelblaze-JSON sowie Marimapper-3D-CSV ')}(<code>index,x,y,z,xn,yn,zn,error</code>) {t('and 2D CSV ', 'und 2D-CSV ')}(<code>index,u,v</code>). {t('Missing indices and rows with empty coordinates are imported, positioned automatically, marked as inferred, and included in export whenever enough measured neighbours exist.', 'Fehlende Indizes und Zeilen mit leeren Koordinaten werden importiert, automatisch positioniert, als berechnet markiert und bei ausreichenden gemessenen Nachbarn in den Export aufgenommen.')}</p></div>
         <div className="help-row"><b>SVG 6.1</b><p>{t('Use File → Import Fixtures. Each LED becomes its own fixture with current ', 'Für File → Import Fixtures. Jede LED wird als eigenes Fixture mit aktuellen ')}<code>universe</code>, <code>channel</code> {t('and', 'und')} <code>fixture_definition</code> {t('attributes.', 'Attributen angelegt.')}</p></div>
         <div className="help-row"><b>CSV</b><p>{t('A robust table alternative for fixture instances, semicolon-delimited and grouped by panel path.', 'Robuste Tabellenalternative für Fixture-Instanzen. Semikolon-getrennt und mit Gruppenpfaden pro Panel.')}</p></div>
         <div className="help-row"><b>MMFL</b><p>{t('For import in the Fixture Editor. It describes a 2D pixel grid and channel layout. The MadMapper product name is taken from Fixture Definition; multi-panel exports add the panel name for uniqueness. Internal details are not fully documented publicly.', 'Für den Import im Fixture Editor. Das Format beschreibt ein 2D-Pixelraster und die Kanalbelegung. Der MadMapper-Produktname wird aus Fixture Definition übernommen; bei mehreren Panels wird zur Unterscheidung der Panelname ergänzt. Die internen Details sind nicht vollständig öffentlich dokumentiert.')}</p></div>

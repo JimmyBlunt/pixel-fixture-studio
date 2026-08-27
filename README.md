@@ -19,7 +19,8 @@ The hosted app currently uses access-controlled Sites hosting. Everyone can run 
 - Pixel editor with coordinate entry, multi-pixel keyboard nudging, search, and insertion
 - Automatic spatial panel detection with per-panel enable/disable controls
 - Large 2D alignment workspace with free rotation, axis snap, scaling, and horizontal/vertical flip
-- Matrix- and zigzag-aware repair suggestions with an adjustable deviation threshold and before/after review
+- Automatic placement and export of missing Marimapper indices or blank coordinate rows
+- Matrix- and zigzag-aware repair with measured coordinates protected by default
 - Optional transparent MMFL cell grid in every 2D preview, including empty output cells
 - MadMapper 6.1 SVG, CSV, and experimental MMFL exports
 - English default interface with instant German translation
@@ -41,7 +42,9 @@ Swap the large workspace to 2D to rotate, snap, scale, or flip the fixture befor
 
 ### 3. Review repairs
 
-Auto Repair only prepares suggestions. The algorithm learns the panel-wide average pitch, row length, and raster or zigzag direction, then combines that model with up to four measured neighbours before and after each pixel. Only deviations above the chosen multiple of average spacing are proposed. Row changes are modelled explicitly. Proposed positions remain visually distinct until explicitly selected and applied, leaving the original measurements untouched during review.
+Missing Marimapper indices and rows with empty coordinates are positioned immediately during CSV import. The algorithm learns the panel-wide average pitch, row length, and raster or zigzag direction, then combines that model with up to four measured neighbours before and after each missing pixel. Automatically inferred pixels are marked in turquoise, included in the active panel and export, and never used to train the model themselves.
+
+Auto Repair protects measured coordinates by default. Scanned outlier review must be enabled explicitly and uses a conservative `2.5 ×` spacing threshold; proposed changes still require individual confirmation.
 
 ![Auto Repair review with sensitivity and zoom controls](docs/images/03-auto-repair.png)
 
@@ -78,7 +81,7 @@ index,u,v
 0,0.12,0.18
 ```
 
-Sparse Marimapper indices are preserved as placeholders so they can be reviewed by Auto Repair.
+Sparse Marimapper indices and indexed rows with blank/non-finite coordinates are preserved. Whenever enough measured neighbours exist, their likely positions are calculated automatically without changing the pixel numbering.
 
 ## MadMapper export formats
 
