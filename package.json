@@ -1,6 +1,8 @@
 {
-  "name": "sites-project",
-  "version": "0.1.0",
+  "name": "pixel-fixture-studio",
+  "version": "1.0.0",
+  "description": "Convert Pixelblaze and Marimapper LED scans into aligned MadMapper fixtures.",
+  "license": "MIT",
   "private": true,
   "engines": {
     "node": ">=22.13.0"

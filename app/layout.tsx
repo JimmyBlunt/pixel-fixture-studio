@@ -1,29 +1,19 @@
 import type { Metadata } from 'next';
-import { Geist, Geist_Mono } from 'next/font/google';
 import './globals.css';
-
-const geistSans = Geist({
-  variable: '--font-geist-sans',
-  subsets: ['latin'],
-});
-
-const geistMono = Geist_Mono({
-  variable: '--font-geist-mono',
-  subsets: ['latin'],
-});
 
 export const metadata: Metadata = {
   title: 'Pixel Fixture Studio',
-  description: 'Pixelblaze 3D mappings auswählen, prüfen und für MadMapper vorbereiten.',
+  description: 'Turn Pixelblaze and Marimapper LED scans into aligned MadMapper fixtures.',
+  icons: { icon: '/favicon.svg' },
   openGraph: {
     title: 'Pixel Fixture Studio',
-    description: 'Pixelblaze 3D-Mappings auswählen und als MadMapper-6.1-Fixtures exportieren.',
-    images: [{ url: '/og.png', width: 1200, height: 630, alt: 'Pixel Fixture Studio mit drei LED-Panels' }],
+    description: 'Turn Pixelblaze and Marimapper LED scans into aligned MadMapper 6.1 fixtures.',
+    images: [{ url: '/og.png', width: 1200, height: 630, alt: 'Pixel Fixture Studio showing three LED panels' }],
   },
   twitter: {
     card: 'summary_large_image',
     title: 'Pixel Fixture Studio',
-    description: 'Pixelblaze 3D-Mappings auswählen und als MadMapper-6.1-Fixtures exportieren.',
+    description: 'Turn Pixelblaze and Marimapper LED scans into aligned MadMapper 6.1 fixtures.',
     images: ['/og.png'],
   },
 };
@@ -34,12 +24,8 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="de">
-      <body
-        className={`${geistSans.variable} ${geistMono.variable} antialiased`}
-      >
-        {children}
-      </body>
+    <html lang="en">
+      <body>{children}</body>
     </html>
   );
 }
