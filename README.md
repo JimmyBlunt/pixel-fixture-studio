@@ -42,9 +42,11 @@ Swap the large workspace to 2D to rotate, snap, scale, or flip the fixture befor
 
 ### 3. Review repairs
 
-For every Marimapper CSV, an import dialog shows the detected source-index range, measured count, and internal gaps, then asks for the authoritative total LED count. The default contains only the span from the first to last CSV index: no leading LEDs are invented, and trailing LEDs are added only when the entered total explicitly requires them. Missing indices and rows with empty coordinates inside that bounded scan are positioned automatically. The algorithm learns the panel-wide average pitch, row length, and raster or zigzag direction, then combines that model with up to four measured neighbours before and after each missing pixel. Automatically inferred pixels are marked in turquoise, included in the active panel and export, and never used to train the model themselves.
+For every Marimapper CSV, an import dialog shows the detected source-index range, measured count, and internal gaps, then asks for the authoritative total LED count. The default contains only the span from the first to last CSV index: no leading LEDs are invented, and trailing LEDs are added only when the entered total explicitly requires them.
 
-Auto Repair protects measured coordinates by default. Scanned outlier review must be enabled explicitly and uses a conservative `2.5 ×` spacing threshold; proposed changes still require individual confirmation.
+Missing indices and rows with empty coordinates inside that bounded scan are positioned automatically. Repeated row turns are evaluated near each missing pixel instead of imposing one matrix width on the whole scan. A single file can therefore contain 4×4 and 16×16 matrices, straight strips, and free lines. Missing cells are extrapolated from matching columns in neighbouring serpentine rows and checked against the nearest intact pixel in the target row. Automatically inferred pixels are marked in turquoise, included in the active panel and export, and never used to detect the row structure themselves.
+
+Auto Repair protects measured coordinates by default. Scanned outlier review must be enabled explicitly. It combines a conservative large-error threshold with an adjustable local line tolerance that projects subtle deviations onto a line fitted from four intact neighbours. Bends and row turns are rejected, and measured corrections are never preselected: every change requires individual confirmation.
 
 ![Auto Repair review with sensitivity and zoom controls](docs/images/03-auto-repair.png)
 

@@ -15,7 +15,7 @@ type RepairSuggestion = {
   sourceIndex: number;
   before: Vec3;
   after: Vec3;
-  reason: 'missing-reading' | 'threshold-deviation';
+  reason: 'missing-reading' | 'threshold-deviation' | 'local-line-deviation';
   confidence: 'high' | 'medium' | 'low';
   deviationRatio: number;
   supportCount: number;
@@ -28,6 +28,8 @@ type MatrixModel = {
   serpentine: boolean;
   positionAt: (sourceIndex: number) => Vec3;
 };
+type SerpentineLayout = { rowLength: number; rowStartPhase: number };
+type LocalLineEstimate = { position: Vec3; deviationRatio: number; lineNoiseRatio: number; supportCount: number };
 
 const COLORS = ['#ff4f87', '#8c7cff', '#37d9c5', '#ffae4f', '#4fa8ff', '#d875ff'];
 
@@ -217,6 +219,118 @@ function modulo(value: number, divisor: number) {
   return ((value % divisor) + divisor) % divisor;
 }
 
+/** Detect the serpentine row pattern nearest one pixel, so mixed 4x4/16x16 scans do not share one global width. */
+function detectSerpentineLayout(panel: Panel, points: MapPoint[], pitch: number, sourceIndex: number): SerpentineLayout | null {
+  const panelSet = new Set(panel.indices);
+  const usable = (index: number) => panelSet.has(index) && points[index]?.status === 'ok';
+  const boundaries: number[] = [];
+  const first = Math.min(...panel.indices), last = Math.max(...panel.indices);
+  for (let index = first + 1; index <= last - 2; index++) {
+    if (![index - 1, index, index + 1, index + 2].every(usable)) continue;
+    const before = sub(points[index].xyz, points[index - 1].xyz);
+    const after = sub(points[index + 2].xyz, points[index + 1].xyz);
+    const turn = dist(points[index].xyz, points[index + 1].xyz);
+    const beforeLength = Math.hypot(...before), afterLength = Math.hypot(...after);
+    const directionChange = dot(before, after) / Math.max(beforeLength * afterLength, .0001);
+    if (directionChange < -.55 && turn <= pitch * 2.5 && beforeLength >= pitch * .2 && beforeLength <= pitch * 2.5 && afterLength >= pitch * .2 && afterLength <= pitch * 2.5) boundaries.push(index);
+  }
+  const gapSamples = boundaries.slice(1).map((boundary, index) => ({
+    gap: boundary - boundaries[index],
+    midpoint: (boundary + boundaries[index]) / 2,
+    left: boundaries[index],
+    right: boundary,
+  })).filter(sample => sample.gap >= 4 && sample.gap <= 256);
+  if (!gapSamples.length) return null;
+  // Score every observed period by proximity and repeated local support. This prevents a large
+  // 16x16 section elsewhere in the same scan from overruling a nearby 4x4 section (and vice versa).
+  const periods = [...new Set(gapSamples.map(sample => sample.gap))].map(rowLength => {
+    const matching = gapSamples.filter(sample => sample.gap === rowLength);
+    const nearestDistance = Math.min(...matching.map(sample => Math.abs(sample.midpoint - sourceIndex)));
+    const localSupport = matching.filter(sample => Math.abs(sample.midpoint - sourceIndex) <= rowLength * 6).length;
+    return { rowLength, matching, nearestDistance, score: nearestDistance / rowLength - Math.min(localSupport, 6) * .65 };
+  }).filter(candidate => candidate.nearestDistance <= candidate.rowLength * 4).sort((a, b) => a.score - b.score);
+  const selected = periods[0];
+  if (!selected) return null;
+  const { rowLength } = selected;
+  const matchingBoundaries = selected.matching.sort((a, b) => Math.abs(a.midpoint - sourceIndex) - Math.abs(b.midpoint - sourceIndex)).slice(0, 6).flatMap(sample => [sample.left, sample.right]);
+  const boundaryPhase = mode(matchingBoundaries.map(boundary => modulo(boundary, rowLength)));
+  const rowStartPhase = boundaryPhase === undefined ? modulo(first, rowLength) : modulo(boundaryPhase + 1, rowLength);
+  return { rowLength, rowStartPhase };
+}
+
+/** Predict one missing serpentine cell from intact neighbouring rows and local row spacing. */
+function estimateSerpentinePosition(sourceIndex: number, panel: Panel, points: MapPoint[], pitch: number) {
+  const layout = detectSerpentineLayout(panel, points, pitch, sourceIndex);
+  if (!layout) return null;
+  const { rowLength, rowStartPhase } = layout;
+  const rowStart = sourceIndex - modulo(sourceIndex - rowStartPhase, rowLength);
+  const offset = sourceIndex - rowStart;
+  const pointAt = (index: number) => {
+    const point = points[index];
+    return point && (point.status === 'ok' || point.status === 'inferred') ? point.xyz : null;
+  };
+  const predictions: Vec3[] = [];
+  const previousRow = pointAt(rowStart - rowLength + (rowLength - 1 - offset));
+  const twoRowsBack = pointAt(rowStart - 2 * rowLength + offset);
+  if (previousRow && twoRowsBack) predictions.push(add(previousRow, sub(previousRow, twoRowsBack)));
+  const nextRow = pointAt(rowStart + rowLength + (rowLength - 1 - offset));
+  const twoRowsAhead = pointAt(rowStart + 2 * rowLength + offset);
+  if (nextRow && twoRowsAhead) predictions.push(sub(nextRow, sub(twoRowsAhead, nextRow)));
+  if (!predictions.length) return null;
+
+  const sameRow = Array.from({ length: rowLength }, (_, localOffset) => ({ index: rowStart + localOffset, xyz: pointAt(rowStart + localOffset) })).filter(item => item.xyz && item.index !== sourceIndex) as { index: number; xyz: Vec3 }[];
+  const nearest = sameRow.sort((a, b) => Math.abs(a.index - sourceIndex) - Math.abs(b.index - sourceIndex))[0];
+  if (!nearest) return averageVec(predictions);
+  const expectedDistance = Math.abs(nearest.index - sourceIndex) * pitch;
+  const ranked = predictions.map(position => ({ position, score: Math.abs(dist(position, nearest.xyz) - expectedDistance) })).sort((a, b) => a.score - b.score);
+  const compatible = ranked.filter(candidate => candidate.score <= ranked[0].score + pitch * .45 && dist(candidate.position, ranked[0].position) <= pitch * 1.5);
+  return averageVec((compatible.length ? compatible : [ranked[0]]).map(candidate => candidate.position));
+}
+
+/** Fit a short 3D line to intact neighbours and project the measured pixel onto that line. */
+function estimateLocalLinePosition(sourceIndex: number, panel: Panel, points: MapPoint[], pitch: number): LocalLineEstimate | null {
+  const panelSet = new Set(panel.indices);
+  const usable = (index: number) => panelSet.has(index) && points[index]?.status === 'ok' && index !== sourceIndex;
+  const groups = [
+    [sourceIndex - 2, sourceIndex - 1, sourceIndex + 1, sourceIndex + 2],
+    [sourceIndex - 4, sourceIndex - 3, sourceIndex - 2, sourceIndex - 1],
+    [sourceIndex + 1, sourceIndex + 2, sourceIndex + 3, sourceIndex + 4],
+  ];
+  const candidates = groups.flatMap(indices => {
+    if (!indices.every(usable)) return [];
+    // Reject groups containing a row jump or a large spatial break.
+    for (let index = 1; index < indices.length; index++) {
+      const sourceGap = indices[index] - indices[index - 1];
+      const spatialGap = dist(points[indices[index - 1]].xyz, points[indices[index]].xyz);
+      if (spatialGap < pitch * .15 * sourceGap || spatialGap > pitch * 2.2 * sourceGap) return [];
+    }
+    const neighbours = indices.map(index => points[index].xyz);
+    const center = averageVec(neighbours);
+    const covariance = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+    neighbours.forEach(position => {
+      const delta = sub(position, center);
+      for (let row = 0; row < 3; row++) for (let column = 0; column < 3; column++) covariance[row][column] += delta[row] * delta[column];
+    });
+    const direction = power(covariance, [1, .4, .2]);
+    const residuals = neighbours.map(position => {
+      const delta = sub(position, center);
+      return Math.hypot(...sub(delta, scaleVec(direction, dot(delta, direction))));
+    });
+    const lineNoiseRatio = Math.sqrt(residuals.reduce((sum, value) => sum + value * value, 0) / residuals.length) / Math.max(pitch, .0001);
+    // Curved corners and matrix turns are not straight-line evidence.
+    if (lineNoiseRatio > .06) return [];
+    const current = points[sourceIndex].xyz;
+    const oneSided = sourceIndex < indices[0] || sourceIndex > indices.at(-1)!;
+    if (oneSided && Math.min(dist(current, neighbours[0]), dist(current, neighbours.at(-1)!)) > pitch * 1.8) return [];
+    const delta = sub(current, center);
+    const position = add(center, scaleVec(direction, dot(delta, direction)));
+    return [{ position, deviationRatio: dist(current, position) / Math.max(pitch, .0001), lineNoiseRatio, supportCount: neighbours.length }];
+  });
+  // At a legitimate row turn, one neighbour group follows the new line and another the old one.
+  // Keeping the smallest correction prevents the turn itself from becoming a false positive.
+  return candidates.sort((a, b) => a.deviationRatio - b.deviationRatio)[0] ?? null;
+}
+
 /** Learn a quantised row/column model from the complete panel measurement. */
 function buildMatrixModel(panel: Panel, points: MapPoint[], fallbackPitch: number): MatrixModel | null {
   const basis = getPanelBasis(panel, points);
@@ -313,20 +427,29 @@ function estimateExpectedPosition(sourceIndex: number, panel: Panel, points: Map
   return candidates.length ? { position: averageVec(candidates), supportCount: neighbours.length, model: null } : null;
 }
 
-/** Suggest only points whose deviation exceeds the user-defined multiple of average LED spacing. */
-function findRepairSuggestions(panel: Panel, points: MapPoint[], pitch: number, threshold: number, includeMeasured = false): RepairSuggestion[] {
+/** Suggest missing readings, large matrix errors, and subtle deviations from a locally straight LED row. */
+function findRepairSuggestions(panel: Panel, points: MapPoint[], pitch: number, threshold: number, lineThreshold: number, includeMeasured = false): RepairSuggestion[] {
   if (!panel.indices.length) return [];
+  const panelSet = new Set(panel.indices);
   const model = buildMatrixModel(panel, points, pitch);
   const sorted = [...panel.indices].sort((a, b) => a - b);
   const minIndex = sorted[0], maxIndex = sorted[sorted.length - 1];
-  return points.slice(minIndex, maxIndex + 1).flatMap(point => {
+  return points.slice(minIndex, maxIndex + 1).flatMap<RepairSuggestion>(point => {
     const isMissing = point.status === 'placeholder';
+    if (!isMissing && !panelSet.has(point.sourceIndex)) return [];
     if (point.status === 'inferred' || (!isMissing && !includeMeasured)) return [];
     const estimate = estimateExpectedPosition(point.sourceIndex, panel, points, pitch, model);
-    if (!estimate || estimate.supportCount < 2) return [];
+    const lineEstimate = !isMissing && includeMeasured ? estimateLocalLinePosition(point.sourceIndex, panel, points, pitch) : null;
+    if ((!estimate || estimate.supportCount < 2) && !lineEstimate) return [];
     const averagePitch = model?.averagePitch ?? pitch;
-    const deviationRatio = isMissing ? Infinity : dist(point.xyz, estimate.position) / Math.max(averagePitch, .0001);
-    if (deviationRatio <= threshold) return [];
+    const deviationRatio = isMissing ? Infinity : estimate ? dist(point.xyz, estimate.position) / Math.max(averagePitch, .0001) : 0;
+    const isLineDeviation = Boolean(lineEstimate && lineEstimate.deviationRatio > lineThreshold && lineEstimate.deviationRatio > Math.max(lineEstimate.lineNoiseRatio * 2.25, .004));
+    if (deviationRatio <= threshold && !isLineDeviation) return [];
+    if (isLineDeviation && lineEstimate) {
+      const confidence: RepairSuggestion['confidence'] = lineEstimate.deviationRatio > Math.max(lineThreshold * 3, lineEstimate.lineNoiseRatio * 5) ? 'high' : lineEstimate.deviationRatio > Math.max(lineThreshold * 1.5, lineEstimate.lineNoiseRatio * 3) ? 'medium' : 'low';
+      return [{ id: `repair-${point.sourceIndex}`, sourceIndex: point.sourceIndex, before: point.xyz, after: lineEstimate.position, reason: 'local-line-deviation', confidence, deviationRatio: lineEstimate.deviationRatio, supportCount: lineEstimate.supportCount, selected: false }];
+    }
+    if (!estimate) return [];
     const confidence: RepairSuggestion['confidence'] = estimate.supportCount >= 6 && model ? 'high' : estimate.supportCount >= 4 ? 'medium' : 'low';
     return [{ id: `repair-${point.sourceIndex}`, sourceIndex: point.sourceIndex, before: point.xyz, after: estimate.position, reason: isMissing ? 'missing-reading' : 'threshold-deviation', confidence, deviationRatio, supportCount: estimate.supportCount, selected: confidence !== 'low' }];
   });
@@ -351,7 +474,8 @@ function placeMissingCoordinates(points: MapPoint[], panels: Panel[], pitch: num
     if (!panel?.indices.length) return;
     const model = buildMatrixModel(panel, placedPoints, pitch);
     const estimate = estimateExpectedPosition(sourceIndex, panel, placedPoints, pitch, model);
-    const position = estimate?.position ?? model?.positionAt(sourceIndex);
+    const serpentinePosition = estimateSerpentinePosition(sourceIndex, panel, placedPoints, pitch);
+    const position = serpentinePosition ?? estimate?.position ?? model?.positionAt(sourceIndex);
     if (!position || !position.every(Number.isFinite)) return;
     point.xyz = position;
     point.status = 'inferred';
@@ -669,6 +793,7 @@ export default function Home() {
   const [expectedLedCount, setExpectedLedCount] = useState('');
   const [repairSuggestions, setRepairSuggestions] = useState<RepairSuggestion[]>([]);
   const [repairThreshold, setRepairThreshold] = useState(2.5);
+  const [lineRepairThreshold, setLineRepairThreshold] = useState(.05);
   const [includeMeasuredRepairs, setIncludeMeasuredRepairs] = useState(false);
   const [repairZoom, setRepairZoom] = useState(1);
   const [settings, setSettings] = useState<ExportSettings>({ universe: 0, channel: 1, channels: 3, ledSize: 6, definition: 'Generic - Pixel RGB' });
@@ -849,7 +974,7 @@ export default function Home() {
   };
   const openRepairReview = () => {
     if (!active) return;
-    const suggestions = findRepairSuggestions(active, points, pitch, repairThreshold, includeMeasuredRepairs);
+    const suggestions = findRepairSuggestions(active, points, pitch, repairThreshold, lineRepairThreshold, includeMeasuredRepairs);
     setRepairSuggestions(suggestions);
     setRepairZoom(1);
     setShowRepair(true);
@@ -860,14 +985,21 @@ export default function Home() {
   const changeRepairThreshold = (next: number) => {
     setRepairThreshold(next);
     if (!active) return;
-    const suggestions = findRepairSuggestions(active, points, pitch, next, includeMeasuredRepairs);
+    const suggestions = findRepairSuggestions(active, points, pitch, next, lineRepairThreshold, includeMeasuredRepairs);
     setRepairSuggestions(suggestions);
     setMessage(t(`${suggestions.length} suggestion${suggestions.length === 1 ? '' : 's'} above ${next.toFixed(2)} × spacing.`, `${suggestions.length} Vorschlag${suggestions.length === 1 ? '' : 'e'} über ${next.toFixed(2)} × Abstand.`));
+  };
+  const changeLineRepairThreshold = (next: number) => {
+    setLineRepairThreshold(next);
+    if (!active) return;
+    const suggestions = findRepairSuggestions(active, points, pitch, repairThreshold, next, includeMeasuredRepairs);
+    setRepairSuggestions(suggestions);
+    setMessage(t(`${suggestions.length} local or matrix-based repair suggestions.`, `${suggestions.length} lokale oder matrixbasierte Reparaturvorschläge.`));
   };
   const changeMeasuredRepairMode = (next: boolean) => {
     setIncludeMeasuredRepairs(next);
     if (!active) return;
-    const suggestions = findRepairSuggestions(active, points, pitch, repairThreshold, next);
+    const suggestions = findRepairSuggestions(active, points, pitch, repairThreshold, lineRepairThreshold, next);
     setRepairSuggestions(suggestions);
     setMessage(next ? t('Measured outlier review enabled. No coordinates change without confirmation.', 'Prüfung gemessener Ausreißer aktiviert. Ohne Bestätigung werden keine Koordinaten verändert.') : t('Measured coordinates protected; only unresolved missing pixels are reviewed.', 'Gemessene Koordinaten geschützt; geprüft werden nur ungelöste fehlende Pixel.'));
   };
@@ -897,6 +1029,7 @@ export default function Home() {
   const repairReason = (reason: RepairSuggestion['reason']) => ({
     'missing-reading': t('Missing reading', 'Fehlender Messwert'),
     'threshold-deviation': t('Deviation above threshold', 'Abweichung über Schwellwert'),
+    'local-line-deviation': t('Local row/line deviation', 'Lokale Zeilen-/Linienabweichung'),
   }[reason]);
   const confidenceLabel = (confidence: RepairSuggestion['confidence']) => ({ high: t('high', 'hoch'), medium: t('medium', 'mittel'), low: t('low', 'niedrig') }[confidence]);
 
@@ -1006,7 +1139,7 @@ export default function Home() {
         <button className="modal-close" aria-label={t('Cancel import', 'Import abbrechen')} onClick={() => setPendingImport(null)}>×</button><span className="eyebrow">{t('MARIMAPPER CSV IMPORT', 'MARIMAPPER-CSV-IMPORT')}</span><h2 id="import-title">{t('How many LEDs should this scan contain?', 'Wie viele LEDs soll dieser Scan enthalten?')}</h2>
         <p className="modal-lead">{t('Only gaps inside the detected CSV range are filled automatically. No LEDs before the first CSV index are created. Additional LEDs after the final index are created only when you deliberately enter a larger total below.', 'Automatisch ergänzt werden nur Lücken innerhalb des erkannten CSV-Bereichs. Vor dem ersten CSV-Index werden keine LEDs erzeugt. Zusätzliche LEDs nach dem letzten Index entstehen nur, wenn du unten bewusst eine größere Gesamtzahl eingibst.')}</p>
         <div className="import-summary"><span>{t('CSV index range', 'CSV-Indexbereich')}<strong>{pendingImport.parsed.sourceRange ? `${pendingImport.parsed.sourceRange[0]}–${pendingImport.parsed.sourceRange[1]}` : '—'}</strong></span><span>{t('Measured LEDs', 'Gemessene LEDs')}<strong>{pendingImport.parsed.measuredCount}</strong></span><span>{t('Internal gaps', 'Interne Lücken')}<strong>{pendingImport.parsed.missingIndices.size}</strong></span></div>
-        <label className="expected-count"><span>{t('Total LEDs in this scan', 'Gesamtzahl LEDs in diesem Scan')}</span><input autoFocus type="number" min={pendingImport.parsed.coords.length} max="20000" step="1" value={expectedLedCount} onChange={event => setExpectedLedCount(event.target.value)} onKeyDown={event => event.key === 'Enter' && confirmCsvImport()} /><small>{t(`Minimum ${pendingImport.parsed.coords.length}: the span from the first to last CSV index.`, `Mindestens ${pendingImport.parsed.coords.length}: der Bereich vom ersten bis zum letzten CSV-Index.`)}</small></label>
+        <div className="import-options"><label className="expected-count"><span>{t('Total LEDs in this scan', 'Gesamtzahl LEDs in diesem Scan')}</span><input autoFocus type="number" min={pendingImport.parsed.coords.length} max="20000" step="1" value={expectedLedCount} onChange={event => setExpectedLedCount(event.target.value)} onKeyDown={event => event.key === 'Enter' && confirmCsvImport()} /><small>{t(`Minimum ${pendingImport.parsed.coords.length}: first through last CSV index.`, `Mindestens ${pendingImport.parsed.coords.length}: erster bis letzter CSV-Index.`)}</small></label><div className="local-pattern-note"><strong>{t('Mixed layouts supported', 'Gemischte Layouts unterstützt')}</strong><small>{t('Row widths are detected separately near every missing LED. A scan may contain 4×4, 16×16, strips and free lines.', 'Zeilenbreiten werden für jede fehlende LED lokal erkannt. Ein Scan darf 4×4-, 16×16-Matrizen, Streifen und freie Linien enthalten.')}</small></div></div>
         <div className="import-safety">{t('The entered number is authoritative. The app will never create a pixel outside that count.', 'Die eingegebene Anzahl ist verbindlich. Die App erzeugt niemals ein Pixel außerhalb dieser Anzahl.')}</div>
         <div className="modal-actions"><button className="secondary-button" onClick={() => setPendingImport(null)}>{t('Cancel', 'Abbrechen')}</button><button className="primary-button" onClick={confirmCsvImport}>{t('Import and position missing pixels', 'Importieren und fehlende Pixel positionieren')}</button></div>
       </section></div>}
@@ -1025,13 +1158,13 @@ export default function Home() {
       {showRepair && active && <div className="modal-backdrop" onMouseDown={() => setShowRepair(false)}><section className="modal repair-modal" onMouseDown={event => event.stopPropagation()} aria-modal="true" role="dialog" aria-labelledby="repair-title">
         <button className="modal-close" aria-label={t('Close', 'Schließen')} onClick={() => setShowRepair(false)}>×</button><span className="eyebrow">{t('AUTO REPAIR · REVIEW', 'AUTO-REPAIR · VORSCHAU')}</span><h2 id="repair-title">{t('Review unresolved pixels', 'Ungelöste Pixel kontrollieren')}</h2><p className="modal-lead">{t('Missing CSV pixels are positioned automatically during import and marked in turquoise. Measured coordinates are protected unless you explicitly include them below.', 'Fehlende CSV-Pixel werden bereits beim Import automatisch positioniert und türkis markiert. Gemessene Koordinaten sind geschützt, solange du sie unten nicht ausdrücklich einbeziehst.')}</p>
         <div className="repair-protection"><label><input type="checkbox" checked={includeMeasuredRepairs} onChange={event => changeMeasuredRepairMode(event.target.checked)} /><span><strong>{t('Include measured outliers', 'Gemessene Ausreißer einbeziehen')}</strong><small>{t('Off by default. Enabling this can propose changes to scanned coordinates, but still requires confirmation.', 'Standardmäßig aus. Aktivieren kann Änderungen an gemessenen Koordinaten vorschlagen; jede Änderung muss weiterhin bestätigt werden.')}</small></span></label></div>
-        <div className="repair-toolbar"><label className={!includeMeasuredRepairs ? 'disabled-control' : ''}>{t('Deviation threshold for measured pixels', 'Abweichungsschwellwert für gemessene Pixel')}<div className="threshold-control"><input disabled={!includeMeasuredRepairs} aria-label={t('Deviation threshold in average pixel spacings', 'Abweichungsschwellwert in mittleren Pixelabständen')} type="range" min="1" max="6" step="0.1" value={repairThreshold} onChange={event => changeRepairThreshold(Number(event.target.value))} /><output>{repairThreshold.toFixed(1)} ×</output></div></label><div className="repair-zoom"><button aria-label={t('Zoom out', 'Verkleinern')} onClick={() => setRepairZoom(value => Math.max(1, value - .5))}>−</button><input aria-label={t('Repair preview zoom', 'Zoom der Reparaturvorschau')} type="range" min="1" max="8" step="0.1" value={repairZoom} onChange={event => setRepairZoom(Number(event.target.value))} /><output>{Math.round(repairZoom * 100)} %</output><button aria-label={t('Zoom in', 'Vergrößern')} onClick={() => setRepairZoom(value => Math.min(8, value + .5))}>＋</button></div></div>
-        {repairModel && <div className="matrix-summary"><span>{t('Detected matrix', 'Erkannte Matrix')}: <b>{repairModel.rowLength}</b> {t('pixels per row', 'Pixel pro Zeile')}</span><span>{repairModel.serpentine ? t('Zigzag wiring', 'Zickzack-Verkabelung') : t('Raster wiring', 'Raster-Verkabelung')}</span><span>{t('Average spacing', 'Mittlerer Abstand')}: <b>{repairModel.averagePitch.toFixed(3)}</b></span></div>}
+        <div className="repair-toolbar"><div className="repair-thresholds"><label className={!includeMeasuredRepairs ? 'disabled-control' : ''}>{t('Large matrix deviation', 'Große Matrixabweichung')}<div className="threshold-control"><input disabled={!includeMeasuredRepairs} aria-label={t('Deviation threshold in average pixel spacings', 'Abweichungsschwellwert in mittleren Pixelabständen')} type="range" min="1" max="6" step="0.1" value={repairThreshold} onChange={event => changeRepairThreshold(Number(event.target.value))} /><output>{repairThreshold.toFixed(1)} ×</output></div></label><label className={!includeMeasuredRepairs ? 'disabled-control' : ''}>{t('Local line tolerance', 'Lokale Linientoleranz')}<div className="threshold-control"><input disabled={!includeMeasuredRepairs} aria-label={t('Local line tolerance as part of average spacing', 'Lokale Linientoleranz als Anteil des mittleren Abstands')} type="range" min="0.005" max="0.25" step="0.005" value={lineRepairThreshold} onChange={event => changeLineRepairThreshold(Number(event.target.value))} /><output>{(lineRepairThreshold * 100).toFixed(1)} %</output></div><small>{t('Lower values find subtler alignment errors; proposed measured changes are never preselected.', 'Kleinere Werte finden feinere Ausrichtungsfehler; Änderungen an Messwerten sind nie vorausgewählt.')}</small></label></div><div className="repair-zoom"><button aria-label={t('Zoom out', 'Verkleinern')} onClick={() => setRepairZoom(value => Math.max(1, value - .5))}>−</button><input aria-label={t('Repair preview zoom', 'Zoom der Reparaturvorschau')} type="range" min="1" max="8" step="0.1" value={repairZoom} onChange={event => setRepairZoom(Number(event.target.value))} /><output>{Math.round(repairZoom * 100)} %</output><button aria-label={t('Zoom in', 'Vergrößern')} onClick={() => setRepairZoom(value => Math.min(8, value + .5))}>＋</button></div></div>
+        {repairModel && <div className="matrix-summary"><span>{t('Local pattern detection', 'Lokale Mustererkennung')}: <b>{t('active', 'aktiv')}</b></span><span>{t('Mixed matrices and straight strips', 'Gemischte Matrizen und gerade Streifen')}</span><span>{t('Average spacing', 'Mittlerer Abstand')}: <b>{repairModel.averagePitch.toFixed(3)}</b></span></div>}
         <RepairPreview language={language} key={active.id} panel={active} points={points} suggestions={repairSuggestions} zoom={repairZoom} onZoomChange={setRepairZoom} />
         <div className="repair-pan-hint">{t('Drag: pan · Wheel: zoom · Double-click: centre', 'Ziehen: Ausschnitt verschieben · Mausrad: zoomen · Doppelklick: zentrieren')}</div>
         <div className="repair-legend"><span><i className="original" /> {t('Original', 'Original')}</span><span><i className="proposed" /> {t('Proposed', 'Vorschlag')}</span><span>{selectedRepairCount}/{repairSuggestions.length} {t('selected', 'ausgewählt')}</span></div>
-        <div className="repair-list">{repairSuggestions.length ? repairSuggestions.map(suggestion => <label className={`repair-row ${suggestion.selected ? 'selected' : ''}`} key={suggestion.id}><input type="checkbox" checked={suggestion.selected} onChange={() => setRepairSuggestions(items => items.map(item => item.id === suggestion.id ? { ...item, selected: !item.selected } : item))} /><span className="repair-index">#{suggestion.sourceIndex + 1}</span><span className="repair-copy"><strong>{repairReason(suggestion.reason)}</strong><small>{suggestion.before.map(value => value.toFixed(2)).join(' / ')} → {suggestion.after.map(value => value.toFixed(2)).join(' / ')} · {Number.isFinite(suggestion.deviationRatio) ? `${suggestion.deviationRatio.toFixed(2)} ×` : '∞'} · {suggestion.supportCount}/8</small></span><span className={`confidence ${suggestion.confidence}`}>{confidenceLabel(suggestion.confidence)}</span></label>) : <div className="repair-empty">{includeMeasuredRepairs ? t('No measured pixel exceeds the selected threshold.', 'Kein gemessenes Pixel überschreitet den gewählten Schwellwert.') : t('All missing CSV pixels that could be calculated were already positioned automatically. Measured coordinates remain unchanged.', 'Alle berechenbaren fehlenden CSV-Pixel wurden bereits automatisch positioniert. Gemessene Koordinaten bleiben unverändert.')}</div>}</div>
-        <div className="repair-note">{t('Automatic CSV placement combines panel-wide average spacing and the detected matrix/zigzag pattern with up to four previous and four following measured pixels. Inferred pixels never train the model and can be adjusted manually in the Pixel Editor.', 'Die automatische CSV-Platzierung kombiniert den mittleren Abstand des Panels und das erkannte Matrix-/Zickzack-Muster mit bis zu vier vorherigen und vier nachfolgenden gemessenen Pixeln. Berechnete Pixel trainieren das Modell niemals und können im Pixel-Editor manuell angepasst werden.')}</div>
+        <div className="repair-list">{repairSuggestions.length ? repairSuggestions.map(suggestion => <label className={`repair-row ${suggestion.selected ? 'selected' : ''}`} key={suggestion.id}><input type="checkbox" checked={suggestion.selected} onChange={() => setRepairSuggestions(items => items.map(item => item.id === suggestion.id ? { ...item, selected: !item.selected } : item))} /><span className="repair-index">#{suggestion.sourceIndex + 1}</span><span className="repair-copy"><strong>{repairReason(suggestion.reason)}</strong><small>{suggestion.before.map(value => value.toFixed(2)).join(' / ')} → {suggestion.after.map(value => value.toFixed(2)).join(' / ')} · {Number.isFinite(suggestion.deviationRatio) ? `${suggestion.deviationRatio.toFixed(3)} ×` : '∞'} · {suggestion.supportCount} {t('neighbours', 'Nachbarn')}</small></span><span className={`confidence ${suggestion.confidence}`}>{confidenceLabel(suggestion.confidence)}</span></label>) : <div className="repair-empty">{includeMeasuredRepairs ? t('No measured pixel exceeds the selected local or matrix threshold.', 'Kein gemessenes Pixel überschreitet den lokalen oder Matrix-Schwellwert.') : t('All missing CSV pixels that could be calculated were already positioned automatically. Measured coordinates remain unchanged.', 'Alle berechenbaren fehlenden CSV-Pixel wurden bereits automatisch positioniert. Gemessene Koordinaten bleiben unverändert.')}</div>}</div>
+        <div className="repair-note">{t('Missing CSV positions use the matrix/zigzag pattern detected nearest that pixel, so different matrix sizes can coexist. Measured line corrections use four intact local neighbours, reject bends and row turns, and always require manual selection.', 'Fehlende CSV-Positionen nutzen das Matrix-/Zickzack-Muster direkt in der Nähe des Pixels, sodass verschiedene Matrixgrößen gemeinsam vorkommen können. Linienkorrekturen für Messwerte nutzen vier intakte lokale Nachbarn, verwerfen Kurven und Zeilenwechsel und müssen immer manuell ausgewählt werden.')}</div>
         <div className="modal-actions"><button className="secondary-button" onClick={() => { setShowRepair(false); setRepairSuggestions([]); setMessage(t('Repair suggestions discarded — original data unchanged.', 'Reparaturvorschläge verworfen — Originaldaten unverändert.')); }}>{t('Cancel', 'Abbrechen')}</button><button className="primary-button repair-apply" disabled={!selectedRepairCount} onClick={applyRepairs}>{t(`Apply ${selectedRepairCount} selected`, `${selectedRepairCount} ausgewählte anwenden`)}</button></div>
       </section></div>}
 
@@ -1045,7 +1178,7 @@ export default function Home() {
 
       {showHelp && <div className="modal-backdrop" onMouseDown={() => setShowHelp(false)}><section className="modal help-modal" onMouseDown={event => event.stopPropagation()} aria-modal="true" role="dialog" aria-labelledby="help-title">
         <button className="modal-close" aria-label={t('Close', 'Schließen')} onClick={() => setShowHelp(false)}>×</button><span className="eyebrow">{t('FORMAT HELP', 'FORMAT-HILFE')}</span><h2 id="help-title">{t('Which format should I use?', 'Welches Format wofür?')}</h2>
-        <div className="help-row"><b>Import</b><p>{t('Pixelblaze JSON, Marimapper 3D CSV ', 'Pixelblaze-JSON sowie Marimapper-3D-CSV ')}(<code>index,x,y,z,xn,yn,zn,error</code>) {t('and 2D CSV ', 'und 2D-CSV ')}(<code>index,u,v</code>). {t('For CSV files, the app asks for the expected LED count. Only internal gaps are automatic; extra trailing LEDs require an explicitly larger count. Missing entries are positioned, marked as inferred, and included in export.', 'Bei CSV-Dateien fragt die App nach der erwarteten LED-Anzahl. Nur interne Lücken werden automatisch ergänzt; zusätzliche Endpixel erfordern eine ausdrücklich größere Anzahl. Fehlende Einträge werden positioniert, als berechnet markiert und exportiert.')}</p></div>
+        <div className="help-row"><b>Import</b><p>{t('Pixelblaze JSON, Marimapper 3D CSV ', 'Pixelblaze-JSON sowie Marimapper-3D-CSV ')}(<code>index,x,y,z,xn,yn,zn,error</code>) {t('and 2D CSV ', 'und 2D-CSV ')}(<code>index,u,v</code>). {t('For CSV files, the app asks for the expected LED count. Only internal gaps are automatic; extra trailing LEDs require an explicitly larger count. Missing entries are positioned from locally detected zigzag rows, allowing multiple matrix sizes in one scan, then marked as inferred and included in export.', 'Bei CSV-Dateien fragt die App nach der erwarteten LED-Anzahl. Nur interne Lücken werden automatisch ergänzt; zusätzliche Endpixel erfordern eine ausdrücklich größere Anzahl. Fehlende Einträge werden aus lokal erkannten Zickzack-Zeilen positioniert, sodass mehrere Matrixgrößen in einem Scan möglich sind; anschließend werden sie als berechnet markiert und exportiert.')}</p></div>
         <div className="help-row"><b>SVG 6.1</b><p>{t('Use File → Import Fixtures. Each LED becomes its own fixture with current ', 'Für File → Import Fixtures. Jede LED wird als eigenes Fixture mit aktuellen ')}<code>universe</code>, <code>channel</code> {t('and', 'und')} <code>fixture_definition</code> {t('attributes.', 'Attributen angelegt.')}</p></div>
         <div className="help-row"><b>CSV</b><p>{t('A robust table alternative for fixture instances, semicolon-delimited and grouped by panel path.', 'Robuste Tabellenalternative für Fixture-Instanzen. Semikolon-getrennt und mit Gruppenpfaden pro Panel.')}</p></div>
         <div className="help-row"><b>MMFL</b><p>{t('For import in the Fixture Editor. It describes a 2D pixel grid and channel layout. The MadMapper product name is taken from Fixture Definition; multi-panel exports add the panel name for uniqueness. Internal details are not fully documented publicly.', 'Für den Import im Fixture Editor. Das Format beschreibt ein 2D-Pixelraster und die Kanalbelegung. Der MadMapper-Produktname wird aus Fixture Definition übernommen; bei mehreren Panels wird zur Unterscheidung der Panelname ergänzt. Die internen Details sind nicht vollständig öffentlich dokumentiert.')}</p></div>
