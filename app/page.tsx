@@ -219,7 +219,7 @@ function modulo(value: number, divisor: number) {
   return ((value % divisor) + divisor) % divisor;
 }
 
-/** Detect the serpentine row pattern nearest one pixel, so mixed 4x4/16x16 scans do not share one global width. */
+/** Detect the serpentine row period nearest one pixel without assuming a square or fixed-size matrix. */
 function detectSerpentineLayout(panel: Panel, points: MapPoint[], pitch: number, sourceIndex: number): SerpentineLayout | null {
   const panelSet = new Set(panel.indices);
   const usable = (index: number) => panelSet.has(index) && points[index]?.status === 'ok';
@@ -239,10 +239,10 @@ function detectSerpentineLayout(panel: Panel, points: MapPoint[], pitch: number,
     midpoint: (boundary + boundaries[index]) / 2,
     left: boundaries[index],
     right: boundary,
-  })).filter(sample => sample.gap >= 4 && sample.gap <= 256);
+  })).filter(sample => sample.gap >= 2 && sample.gap <= 2048);
   if (!gapSamples.length) return null;
-  // Score every observed period by proximity and repeated local support. This prevents a large
-  // 16x16 section elsewhere in the same scan from overruling a nearby 4x4 section (and vice versa).
+  // Score every observed period by proximity and repeated local support. Row length and row count
+  // remain independent, so 5x5, 9x9, 8x32, 32x8 and other local layouts can coexist.
   const periods = [...new Set(gapSamples.map(sample => sample.gap))].map(rowLength => {
     const matching = gapSamples.filter(sample => sample.gap === rowLength);
     const nearestDistance = Math.min(...matching.map(sample => Math.abs(sample.midpoint - sourceIndex)));
@@ -1139,7 +1139,7 @@ export default function Home() {
         <button className="modal-close" aria-label={t('Cancel import', 'Import abbrechen')} onClick={() => setPendingImport(null)}>×</button><span className="eyebrow">{t('MARIMAPPER CSV IMPORT', 'MARIMAPPER-CSV-IMPORT')}</span><h2 id="import-title">{t('How many LEDs should this scan contain?', 'Wie viele LEDs soll dieser Scan enthalten?')}</h2>
         <p className="modal-lead">{t('Only gaps inside the detected CSV range are filled automatically. No LEDs before the first CSV index are created. Additional LEDs after the final index are created only when you deliberately enter a larger total below.', 'Automatisch ergänzt werden nur Lücken innerhalb des erkannten CSV-Bereichs. Vor dem ersten CSV-Index werden keine LEDs erzeugt. Zusätzliche LEDs nach dem letzten Index entstehen nur, wenn du unten bewusst eine größere Gesamtzahl eingibst.')}</p>
         <div className="import-summary"><span>{t('CSV index range', 'CSV-Indexbereich')}<strong>{pendingImport.parsed.sourceRange ? `${pendingImport.parsed.sourceRange[0]}–${pendingImport.parsed.sourceRange[1]}` : '—'}</strong></span><span>{t('Measured LEDs', 'Gemessene LEDs')}<strong>{pendingImport.parsed.measuredCount}</strong></span><span>{t('Internal gaps', 'Interne Lücken')}<strong>{pendingImport.parsed.missingIndices.size}</strong></span></div>
-        <div className="import-options"><label className="expected-count"><span>{t('Total LEDs in this scan', 'Gesamtzahl LEDs in diesem Scan')}</span><input autoFocus type="number" min={pendingImport.parsed.coords.length} max="20000" step="1" value={expectedLedCount} onChange={event => setExpectedLedCount(event.target.value)} onKeyDown={event => event.key === 'Enter' && confirmCsvImport()} /><small>{t(`Minimum ${pendingImport.parsed.coords.length}: first through last CSV index.`, `Mindestens ${pendingImport.parsed.coords.length}: erster bis letzter CSV-Index.`)}</small></label><div className="local-pattern-note"><strong>{t('Mixed layouts supported', 'Gemischte Layouts unterstützt')}</strong><small>{t('Row widths are detected separately near every missing LED. A scan may contain 4×4, 16×16, strips and free lines.', 'Zeilenbreiten werden für jede fehlende LED lokal erkannt. Ein Scan darf 4×4-, 16×16-Matrizen, Streifen und freie Linien enthalten.')}</small></div></div>
+        <div className="import-options"><label className="expected-count"><span>{t('Total LEDs in this scan', 'Gesamtzahl LEDs in diesem Scan')}</span><input autoFocus type="number" min={pendingImport.parsed.coords.length} max="20000" step="1" value={expectedLedCount} onChange={event => setExpectedLedCount(event.target.value)} onKeyDown={event => event.key === 'Enter' && confirmCsvImport()} /><small>{t(`Minimum ${pendingImport.parsed.coords.length}: first through last CSV index.`, `Mindestens ${pendingImport.parsed.coords.length}: erster bis letzter CSV-Index.`)}</small></label><div className="local-pattern-note"><strong>{t('Any mixed layout', 'Beliebige gemischte Layouts')}</strong><small>{t('Local row lengths are detected independently. Square and rectangular matrices of any size — for example 5×5, 9×9, 8×32 or 32×8 — may coexist with strips and free lines.', 'Lokale Zeilenlängen werden unabhängig erkannt. Quadratische und rechteckige Matrizen beliebiger Größe – beispielsweise 5×5, 9×9, 8×32 oder 32×8 – dürfen gemeinsam mit Streifen und freien Linien vorkommen.')}</small></div></div>
         <div className="import-safety">{t('The entered number is authoritative. The app will never create a pixel outside that count.', 'Die eingegebene Anzahl ist verbindlich. Die App erzeugt niemals ein Pixel außerhalb dieser Anzahl.')}</div>
         <div className="modal-actions"><button className="secondary-button" onClick={() => setPendingImport(null)}>{t('Cancel', 'Abbrechen')}</button><button className="primary-button" onClick={confirmCsvImport}>{t('Import and position missing pixels', 'Importieren und fehlende Pixel positionieren')}</button></div>
       </section></div>}
