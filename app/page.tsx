@@ -219,12 +219,34 @@ function modulo(value: number, divisor: number) {
   return ((value % divisor) + divisor) % divisor;
 }
 
+/** Find the indexed spatial run around one pixel, separating distant matrices and strips. */
+function localIndexSegment(panel: Panel, points: MapPoint[], pitch: number, sourceIndex: number) {
+  const valid = panel.indices.filter(index => points[index]?.status === 'ok').sort((a, b) => a - b);
+  if (!valid.length) return { first: sourceIndex, last: sourceIndex };
+  const segments: { first: number; last: number }[] = [];
+  let first = valid[0];
+  for (let offset = 1; offset < valid.length; offset++) {
+    const previous = valid[offset - 1], current = valid[offset];
+    const indexGap = current - previous;
+    const spatialGap = dist(points[previous].xyz, points[current].xyz);
+    if (spatialGap > pitch * Math.max(indexGap * 2.5, 4)) {
+      segments.push({ first, last: previous });
+      first = current;
+    }
+  }
+  segments.push({ first, last: valid.at(-1)! });
+  return segments.sort((a, b) => {
+    const distanceTo = (segment: { first: number; last: number }) => sourceIndex < segment.first ? segment.first - sourceIndex : sourceIndex > segment.last ? sourceIndex - segment.last : 0;
+    return distanceTo(a) - distanceTo(b);
+  })[0];
+}
+
 /** Detect the serpentine row period nearest one pixel without assuming a square or fixed-size matrix. */
 function detectSerpentineLayout(panel: Panel, points: MapPoint[], pitch: number, sourceIndex: number): SerpentineLayout | null {
   const panelSet = new Set(panel.indices);
   const usable = (index: number) => panelSet.has(index) && points[index]?.status === 'ok';
   const boundaries: number[] = [];
-  const first = Math.min(...panel.indices), last = Math.max(...panel.indices);
+  const { first, last } = localIndexSegment(panel, points, pitch, sourceIndex);
   for (let index = first + 1; index <= last - 2; index++) {
     if (![index - 1, index, index + 1, index + 2].every(usable)) continue;
     const before = sub(points[index].xyz, points[index - 1].xyz);
@@ -247,9 +269,14 @@ function detectSerpentineLayout(panel: Panel, points: MapPoint[], pitch: number,
     const matching = gapSamples.filter(sample => sample.gap === rowLength);
     const nearestDistance = Math.min(...matching.map(sample => Math.abs(sample.midpoint - sourceIndex)));
     const localSupport = matching.filter(sample => Math.abs(sample.midpoint - sourceIndex) <= rowLength * 6).length;
-    return { rowLength, matching, nearestDistance, score: nearestDistance / rowLength - Math.min(localSupport, 6) * .65 };
-  }).filter(candidate => candidate.nearestDistance <= candidate.rowLength * 4).sort((a, b) => a.score - b.score);
-  const selected = periods[0];
+    const totalSupport = matching.length;
+    const harmonicSupport = gapSamples.filter(sample => sample.gap % rowLength === 0).length;
+    return { rowLength, matching, nearestDistance, localSupport, totalSupport, harmonicSupport, score: nearestDistance / rowLength - Math.min(localSupport, 6) * .65 };
+  });
+  // Missed row turns produce harmonic gaps (for example 16 instead of the real period 8).
+  // Prefer the smallest repeated period that explains most observed gaps within this spatial run.
+  const fundamental = periods.filter(candidate => candidate.totalSupport >= 2 && candidate.harmonicSupport >= Math.max(2, Math.ceil(gapSamples.length * .55))).sort((a, b) => a.rowLength - b.rowLength)[0];
+  const selected = fundamental ?? periods.filter(candidate => candidate.nearestDistance <= candidate.rowLength * 4).sort((a, b) => a.score - b.score)[0];
   if (!selected) return null;
   const { rowLength } = selected;
   const matchingBoundaries = selected.matching.sort((a, b) => Math.abs(a.midpoint - sourceIndex) - Math.abs(b.midpoint - sourceIndex)).slice(0, 6).flatMap(sample => [sample.left, sample.right]);
@@ -549,10 +576,33 @@ function quantizePanelGrid(panel: Panel, points: MapPoint[], channels = 3) {
   const projected = transformProjection(baseProjected, panel.transform);
   if (!projected.length) return { projected, pitch: 1, uMin: 0, vMin: 0, cells: [] as { x: number; y: number; value: number; sourceIndex: number }[], width: 1, height: 1 };
   const nearest2d = baseProjected.map((p, i) => Math.min(...baseProjected.filter((_, j) => i !== j).map(q => Math.hypot(p.u - q.u, p.v - q.v)))).filter(Number.isFinite);
-  const pitch = Math.max(median(nearest2d), .001);
+  const basePitch = Math.max(median(nearest2d), .001);
   const uMin = Math.min(...projected.map(point => point.u));
   const vMin = Math.min(...projected.map(point => point.v));
-  const cells = projected.map((point, rank) => ({ x: Math.round((point.u - uMin) / pitch), y: Math.round((point.v - vMin) / pitch), value: 1 + rank * channels, sourceIndex: point.sourceIndex }));
+  // A panel may combine sections with different physical spacing. Reduce the cell pitch until
+  // rounding no longer places two LEDs in the same MMFL cell; the old exporter silently dropped
+  // every later LED in such a collision.
+  let pitch = basePitch;
+  let cells = projected.map((point, rank) => ({ x: Math.round((point.u - uMin) / pitch), y: Math.round((point.v - vMin) / pitch), value: 1 + rank * channels, sourceIndex: point.sourceIndex }));
+  for (let attempt = 0; attempt < 24; attempt++) {
+    const occupied = new Set(cells.map(cell => `${cell.x}:${cell.y}`));
+    if (occupied.size === cells.length) break;
+    pitch *= .9;
+    cells = projected.map((point, rank) => ({ x: Math.round((point.u - uMin) / pitch), y: Math.round((point.v - vMin) / pitch), value: 1 + rank * channels, sourceIndex: point.sourceIndex }));
+  }
+  const occupied = new Set<string>();
+  cells = cells.map(cell => {
+    let x = cell.x, y = cell.y, radius = 0;
+    while (occupied.has(`${x}:${y}`)) {
+      radius += 1;
+      const alternatives: [number, number][] = [];
+      for (let delta = -radius; delta <= radius; delta++) alternatives.push([cell.x + delta, cell.y - radius], [cell.x + delta, cell.y + radius], [cell.x - radius, cell.y + delta], [cell.x + radius, cell.y + delta]);
+      const available = alternatives.find(([candidateX, candidateY]) => candidateX >= 0 && candidateY >= 0 && !occupied.has(`${candidateX}:${candidateY}`));
+      if (available) [x, y] = available;
+    }
+    occupied.add(`${x}:${y}`);
+    return { ...cell, x, y };
+  });
   const width = Math.max(...cells.map(cell => cell.x)) + 1;
   const height = Math.max(...cells.map(cell => cell.y)) + 1;
   return { projected, pitch, uMin, vMin, cells, width, height };

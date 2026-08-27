@@ -36,7 +36,7 @@ Open the [hosted app](https://pixel-fixture-studio.jimmyblunt44.chatgpt.site/) (
 
 Choose a detected panel or draw a box around LEDs to create a custom panel. Click a pixel to inspect and edit its X/Y/Z values, search by its one-based pixel number, or enable Edit Mode to move a selection with the arrow keys. `Page Up`/`Page Down` move Z and `Shift` uses a 10× step. New pixels can be inserted into the active panel; following source numbers shift forward.
 
-Swap the large workspace to 2D to rotate, snap, scale, or flip the fixture before export. Enable the MMFL grid to see the exact quantised cells, including empty cells, that the MMFL export will contain.
+Swap the large workspace to 2D to rotate, snap, scale, or flip the fixture before export. Enable the MMFL grid to see the exact quantised cells, including empty cells, that the MMFL export will contain. When differently spaced structures share one panel, the grid resolution increases automatically until every LED has a unique MMFL cell.
 
 ![Large MadMapper-style 2D alignment view](docs/images/02-2d-alignment.png)
 
