@@ -2,13 +2,15 @@
 
 > Turn irregular Pixelblaze and Marimapper LED scans into clean, aligned MadMapper fixtures — entirely in your browser.
 
-[![Live app](https://img.shields.io/badge/live-Pixel_Fixture_Studio-ff4f87)](https://pixel-fixture-studio.jimmyblunt44.chatgpt.site/)
+[![Hosted app](https://img.shields.io/badge/hosted-Pixel_Fixture_Studio-ff4f87)](https://pixel-fixture-studio.jimmyblunt44.chatgpt.site/)
 [![CI](https://github.com/JimmyBlunt/pixel-fixture-studio/actions/workflows/ci.yml/badge.svg)](https://github.com/JimmyBlunt/pixel-fixture-studio/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-8c7cff.svg)](LICENSE)
 
 ![Pixel Fixture Studio showing three detected LED panels](docs/images/01-3d-workspace.png)
 
 Pixel Fixture Studio is a local-first visual workflow for scanned, irregular LED installations. Load a Pixelblaze JSON map or a Marimapper CSV, inspect the reconstructed installation in 3D, isolate physical panels, repair suspicious measurements, align each panel in 2D, and export MadMapper-ready fixture files.
+
+The hosted app currently uses access-controlled Sites hosting. Everyone can run the public source locally with the instructions below.
 
 ## Highlights
 
@@ -25,7 +27,7 @@ Pixel Fixture Studio is a local-first visual workflow for scanned, irregular LED
 
 ### 1. Load and inspect
 
-Open the [live app](https://pixel-fixture-studio.jimmyblunt44.chatgpt.site/) and load a mapping file. The included demo shows three separated panels, so every tool can be explored without supplying data.
+Open the [hosted app](https://pixel-fixture-studio.jimmyblunt44.chatgpt.site/) (workspace access may be required) or run it locally, then load a mapping file. The included demo shows three separated panels, so every tool can be explored without supplying data.
 
 ### 2. Select and align
 
