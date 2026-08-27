@@ -42,7 +42,7 @@ Swap the large workspace to 2D to rotate, snap, scale, or flip the fixture befor
 
 ### 3. Review repairs
 
-Missing Marimapper indices and rows with empty coordinates are positioned immediately during CSV import. The algorithm learns the panel-wide average pitch, row length, and raster or zigzag direction, then combines that model with up to four measured neighbours before and after each missing pixel. Automatically inferred pixels are marked in turquoise, included in the active panel and export, and never used to train the model themselves.
+For every Marimapper CSV, an import dialog shows the detected source-index range, measured count, and internal gaps, then asks for the authoritative total LED count. The default contains only the span from the first to last CSV index: no leading LEDs are invented, and trailing LEDs are added only when the entered total explicitly requires them. Missing indices and rows with empty coordinates inside that bounded scan are positioned automatically. The algorithm learns the panel-wide average pitch, row length, and raster or zigzag direction, then combines that model with up to four measured neighbours before and after each missing pixel. Automatically inferred pixels are marked in turquoise, included in the active panel and export, and never used to train the model themselves.
 
 Auto Repair protects measured coordinates by default. Scanned outlier review must be enabled explicitly and uses a conservative `2.5 ×` spacing threshold; proposed changes still require individual confirmation.
 
@@ -81,7 +81,7 @@ index,u,v
 0,0.12,0.18
 ```
 
-Sparse Marimapper indices and indexed rows with blank/non-finite coordinates are preserved. Whenever enough measured neighbours exist, their likely positions are calculated automatically without changing the pixel numbering.
+Sparse Marimapper indices and indexed rows with blank/non-finite coordinates are preserved within the confirmed scan length. Whenever enough measured neighbours exist, their likely positions are calculated automatically without changing the order. A non-zero first CSV index becomes the first loaded slot, preventing phantom LEDs before the actual scan.
 
 ## MadMapper export formats
 

@@ -21,7 +21,7 @@ type RepairSuggestion = {
   supportCount: number;
   selected: boolean;
 };
-type ParsedMap = { coords: Vec3[]; missingIndices: Set<number>; sourceLabel: string; measuredCount: number };
+type ParsedMap = { coords: Vec3[]; missingIndices: Set<number>; sourceLabel: string; measuredCount: number; sourceRange?: [number, number] };
 type MatrixModel = {
   averagePitch: number;
   rowLength: number;
@@ -114,11 +114,13 @@ function parseMarimapperCsv(text: string, language: Language): ParsedMap {
     if (xyz.every(Number.isFinite)) measured.set(index, xyz as Vec3);
   });
   if (!measured.size) throw new Error(translated(language, 'The Marimapper CSV does not contain valid LEDs.', 'Die Marimapper-CSV enthält keine gültigen LEDs.'));
-  const maxIndex = Math.max(...declaredIndices);
-  if (maxIndex >= 20000) throw new Error(translated(language, 'The interactive preview supports up to 20,000 LED slots.', 'Für die interaktive Vorschau sind maximal 20.000 LED-Slots vorgesehen.'));
-  const coords = Array.from({ length: maxIndex + 1 }, (_, index) => measured.get(index) ?? [0, 0, 0] as Vec3);
-  const missingIndices = new Set(coords.map((_, index) => index).filter(index => !measured.has(index)));
-  return { coords, missingIndices, sourceLabel: is3d ? 'Marimapper 3D-CSV' : 'Marimapper 2D-CSV', measuredCount: measured.size };
+  const firstIndex = Math.min(...declaredIndices), lastIndex = Math.max(...declaredIndices);
+  const span = lastIndex - firstIndex + 1;
+  if (span > 20000) throw new Error(translated(language, 'The interactive preview supports up to 20,000 LED slots.', 'Für die interaktive Vorschau sind maximal 20.000 LED-Slots vorgesehen.'));
+  // Normalise the loaded scan range so indices before the first CSV row never become invented LEDs.
+  const coords = Array.from({ length: span }, (_, index) => measured.get(firstIndex + index) ?? [0, 0, 0] as Vec3);
+  const missingIndices = new Set(coords.map((_, index) => index).filter(index => !measured.has(firstIndex + index)));
+  return { coords, missingIndices, sourceLabel: is3d ? 'Marimapper 3D-CSV' : 'Marimapper 2D-CSV', measuredCount: measured.size, sourceRange: [firstIndex, lastIndex] };
 }
 
 /** Detect spatially connected panels while retaining placeholders and outliers. */
@@ -663,6 +665,8 @@ export default function Home() {
   const [showHelp, setShowHelp] = useState(false);
   const [showAdjust, setShowAdjust] = useState(false);
   const [showRepair, setShowRepair] = useState(false);
+  const [pendingImport, setPendingImport] = useState<{ parsed: ParsedMap; fileName: string } | null>(null);
+  const [expectedLedCount, setExpectedLedCount] = useState('');
   const [repairSuggestions, setRepairSuggestions] = useState<RepairSuggestion[]>([]);
   const [repairThreshold, setRepairThreshold] = useState(2.5);
   const [includeMeasuredRepairs, setIncludeMeasuredRepairs] = useState(false);
@@ -709,6 +713,38 @@ export default function Home() {
     setMessage(next === 'en' ? 'Language changed to English.' : 'Sprache auf Deutsch umgestellt.');
   };
 
+  const applyParsedMap = (parsed: ParsedMap, importedFileName: string, requestedCount = parsed.coords.length) => {
+    const count = Math.trunc(requestedCount);
+    if (!Number.isInteger(count) || count < parsed.coords.length || count > 20000) throw new Error(t(`Choose an LED count between ${parsed.coords.length} and 20,000.`, `Wähle eine LED-Anzahl zwischen ${parsed.coords.length} und 20.000.`));
+    const coords = Array.from({ length: count }, (_, index) => parsed.coords[index] ?? [0, 0, 0] as Vec3);
+    const missingIndices = new Set(parsed.missingIndices);
+    for (let index = parsed.coords.length; index < count; index++) missingIndices.add(index);
+    const analyzed = analyze(coords, missingIndices);
+    if (!analyzed.panels.length) throw new Error(t('No connected LED regions were detected. Use a clean scan or select points manually.', 'Keine zusammenhängenden LED-Bereiche erkannt. Nutze eine sauber gescannte Map oder wähle Punkte manuell.'));
+    const recovered = missingIndices.size ? placeMissingCoordinates(analyzed.points, analyzed.panels, analyzed.pitch, missingIndices) : { points: analyzed.points, panels: analyzed.panels, placed: 0, unresolved: 0 };
+    setPoints(recovered.points);
+    setPanels(recovered.panels);
+    setActiveId(recovered.panels[0].id);
+    setPitch(analyzed.pitch);
+    setFileName(importedFileName);
+    setSelection([]);
+    setPixelSearch('');
+    setInsertAt('');
+    setRepairSuggestions([]);
+    setRepairZoom(1);
+    setShowRepair(false);
+    setShowAdjust(false);
+    setStageMode('3d');
+    setIncludeMeasuredRepairs(false);
+    setPendingImport(null);
+    setError('');
+    const gapInfo = missingIndices.size ? t(` · ${recovered.placed} missing indices positioned automatically${recovered.unresolved ? ` · ${recovered.unresolved} unresolved` : ''}`, ` · ${recovered.placed} fehlende Indizes automatisch positioniert${recovered.unresolved ? ` · ${recovered.unresolved} ungelöst` : ''}`) : '';
+    setMessage(t(
+      `${parsed.sourceLabel}: ${numberFormat.format(coords.length)} slots loaded · ${recovered.panels.length} panels detected${gapInfo}.`,
+      `${parsed.sourceLabel}: ${numberFormat.format(coords.length)} Slots geladen · ${recovered.panels.length} Panels erkannt${gapInfo}.`,
+    ));
+  };
+
   const loadFile = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (!file) return;
@@ -718,35 +754,22 @@ export default function Home() {
       const parsed: ParsedMap = isCsv
         ? parseMarimapperCsv(text, language)
         : { coords: extractCoordinates(JSON.parse(text), language), missingIndices: new Set<number>(), sourceLabel: 'Pixelblaze JSON', measuredCount: 0 };
-      const coords = parsed.coords;
-      if (coords.length > 20000) throw new Error(t('The interactive preview supports up to 20,000 LEDs.', 'Für die interaktive Vorschau sind maximal 20.000 LEDs vorgesehen.'));
-      const analyzed = analyze(coords, parsed.missingIndices);
-      if (!analyzed.panels.length) throw new Error(t('No connected LED regions were detected. Use a clean scan or select points manually.', 'Keine zusammenhängenden LED-Bereiche erkannt. Nutze eine sauber gescannte Map oder wähle Punkte manuell.'));
-      const recovered = parsed.missingIndices.size ? placeMissingCoordinates(analyzed.points, analyzed.panels, analyzed.pitch, parsed.missingIndices) : { points: analyzed.points, panels: analyzed.panels, placed: 0, unresolved: 0 };
-      setPoints(recovered.points);
-      setPanels(recovered.panels);
-      setActiveId(recovered.panels[0].id);
-      setPitch(analyzed.pitch);
-      setFileName(file.name);
-      setSelection([]);
-      setPixelSearch('');
-      setInsertAt('');
-      setRepairSuggestions([]);
-      setRepairZoom(1);
-      setShowRepair(false);
-      setShowAdjust(false);
-      setStageMode('3d');
-      setIncludeMeasuredRepairs(false);
-      setError('');
-      const gapInfo = parsed.missingIndices.size ? t(` · ${recovered.placed} missing indices positioned automatically${recovered.unresolved ? ` · ${recovered.unresolved} unresolved` : ''}`, ` · ${recovered.placed} fehlende Indizes automatisch positioniert${recovered.unresolved ? ` · ${recovered.unresolved} ungelöst` : ''}`) : '';
-      setMessage(t(
-        `${parsed.sourceLabel}: ${numberFormat.format(coords.length)} slots loaded · ${recovered.panels.length} panels detected${gapInfo}.`,
-        `${parsed.sourceLabel}: ${numberFormat.format(coords.length)} Slots geladen · ${recovered.panels.length} Panels erkannt${gapInfo}.`,
-      ));
+      if (parsed.coords.length > 20000) throw new Error(t('The interactive preview supports up to 20,000 LEDs.', 'Für die interaktive Vorschau sind maximal 20.000 LEDs vorgesehen.'));
+      if (isCsv) {
+        setPendingImport({ parsed, fileName: file.name });
+        setExpectedLedCount(String(parsed.coords.length));
+        setError('');
+      } else applyParsedMap(parsed, file.name);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : t('The file could not be read.', 'Die Datei konnte nicht gelesen werden.'));
     }
     event.target.value = '';
+  };
+
+  const confirmCsvImport = () => {
+    if (!pendingImport) return;
+    try { applyParsedMap(pendingImport.parsed, pendingImport.fileName, Number(expectedLedCount)); }
+    catch (cause) { setError(cause instanceof Error ? cause.message : t('The CSV could not be imported.', 'Die CSV konnte nicht importiert werden.')); }
   };
 
   const togglePanel = (id: string) => setPanels(items => items.map(item => item.id === id ? { ...item, enabled: !item.enabled } : item));
@@ -979,6 +1002,15 @@ export default function Home() {
 
       {error && <div className="toast error" role="alert"><span>!</span>{error}<button aria-label={t('Close error', 'Fehler schließen')} onClick={() => setError('')}>×</button></div>}
 
+      {pendingImport && <div className="modal-backdrop" onMouseDown={() => setPendingImport(null)}><section className="modal import-modal" onMouseDown={event => event.stopPropagation()} aria-modal="true" role="dialog" aria-labelledby="import-title">
+        <button className="modal-close" aria-label={t('Cancel import', 'Import abbrechen')} onClick={() => setPendingImport(null)}>×</button><span className="eyebrow">{t('MARIMAPPER CSV IMPORT', 'MARIMAPPER-CSV-IMPORT')}</span><h2 id="import-title">{t('How many LEDs should this scan contain?', 'Wie viele LEDs soll dieser Scan enthalten?')}</h2>
+        <p className="modal-lead">{t('Only gaps inside the detected CSV range are filled automatically. No LEDs before the first CSV index are created. Additional LEDs after the final index are created only when you deliberately enter a larger total below.', 'Automatisch ergänzt werden nur Lücken innerhalb des erkannten CSV-Bereichs. Vor dem ersten CSV-Index werden keine LEDs erzeugt. Zusätzliche LEDs nach dem letzten Index entstehen nur, wenn du unten bewusst eine größere Gesamtzahl eingibst.')}</p>
+        <div className="import-summary"><span>{t('CSV index range', 'CSV-Indexbereich')}<strong>{pendingImport.parsed.sourceRange ? `${pendingImport.parsed.sourceRange[0]}–${pendingImport.parsed.sourceRange[1]}` : '—'}</strong></span><span>{t('Measured LEDs', 'Gemessene LEDs')}<strong>{pendingImport.parsed.measuredCount}</strong></span><span>{t('Internal gaps', 'Interne Lücken')}<strong>{pendingImport.parsed.missingIndices.size}</strong></span></div>
+        <label className="expected-count"><span>{t('Total LEDs in this scan', 'Gesamtzahl LEDs in diesem Scan')}</span><input autoFocus type="number" min={pendingImport.parsed.coords.length} max="20000" step="1" value={expectedLedCount} onChange={event => setExpectedLedCount(event.target.value)} onKeyDown={event => event.key === 'Enter' && confirmCsvImport()} /><small>{t(`Minimum ${pendingImport.parsed.coords.length}: the span from the first to last CSV index.`, `Mindestens ${pendingImport.parsed.coords.length}: der Bereich vom ersten bis zum letzten CSV-Index.`)}</small></label>
+        <div className="import-safety">{t('The entered number is authoritative. The app will never create a pixel outside that count.', 'Die eingegebene Anzahl ist verbindlich. Die App erzeugt niemals ein Pixel außerhalb dieser Anzahl.')}</div>
+        <div className="modal-actions"><button className="secondary-button" onClick={() => setPendingImport(null)}>{t('Cancel', 'Abbrechen')}</button><button className="primary-button" onClick={confirmCsvImport}>{t('Import and position missing pixels', 'Importieren und fehlende Pixel positionieren')}</button></div>
+      </section></div>}
+
       {showAdjust && active && <div className="modal-backdrop" onMouseDown={() => setShowAdjust(false)}><section className="modal adjust-modal" onMouseDown={event => event.stopPropagation()} aria-modal="true" role="dialog" aria-labelledby="adjust-title">
         <button className="modal-close" aria-label={t('Close', 'Schließen')} onClick={() => setShowAdjust(false)}>×</button><span className="eyebrow">{t('2D ALIGNMENT', '2D-AUSRICHTUNG')}</span><h2 id="adjust-title">{t(`Adjust ${active.name}`, `${active.name} justieren`)}</h2><p className="modal-lead">{t('Drag the panel freely around its centre. Use the mouse wheel to change its export size.', 'Ziehe das Panel frei um seinen Mittelpunkt. Mit dem Mausrad veränderst du seine Exportgröße.')}</p>
         <div className="adjust-layout"><div className="adjust-preview"><FixturePreview language={language} panel={active} points={points} ledSize={settings.ledSize} interactive showOutputGrid={showOutputGrid} onTransform={updatePanelTransform} /><div className="adjust-hint">{t('Drag: rotate · Wheel: scale', 'Ziehen: drehen · Mausrad: skalieren')}</div></div><div className="adjust-controls">
@@ -1013,7 +1045,7 @@ export default function Home() {
 
       {showHelp && <div className="modal-backdrop" onMouseDown={() => setShowHelp(false)}><section className="modal help-modal" onMouseDown={event => event.stopPropagation()} aria-modal="true" role="dialog" aria-labelledby="help-title">
         <button className="modal-close" aria-label={t('Close', 'Schließen')} onClick={() => setShowHelp(false)}>×</button><span className="eyebrow">{t('FORMAT HELP', 'FORMAT-HILFE')}</span><h2 id="help-title">{t('Which format should I use?', 'Welches Format wofür?')}</h2>
-        <div className="help-row"><b>Import</b><p>{t('Pixelblaze JSON, Marimapper 3D CSV ', 'Pixelblaze-JSON sowie Marimapper-3D-CSV ')}(<code>index,x,y,z,xn,yn,zn,error</code>) {t('and 2D CSV ', 'und 2D-CSV ')}(<code>index,u,v</code>). {t('Missing indices and rows with empty coordinates are imported, positioned automatically, marked as inferred, and included in export whenever enough measured neighbours exist.', 'Fehlende Indizes und Zeilen mit leeren Koordinaten werden importiert, automatisch positioniert, als berechnet markiert und bei ausreichenden gemessenen Nachbarn in den Export aufgenommen.')}</p></div>
+        <div className="help-row"><b>Import</b><p>{t('Pixelblaze JSON, Marimapper 3D CSV ', 'Pixelblaze-JSON sowie Marimapper-3D-CSV ')}(<code>index,x,y,z,xn,yn,zn,error</code>) {t('and 2D CSV ', 'und 2D-CSV ')}(<code>index,u,v</code>). {t('For CSV files, the app asks for the expected LED count. Only internal gaps are automatic; extra trailing LEDs require an explicitly larger count. Missing entries are positioned, marked as inferred, and included in export.', 'Bei CSV-Dateien fragt die App nach der erwarteten LED-Anzahl. Nur interne Lücken werden automatisch ergänzt; zusätzliche Endpixel erfordern eine ausdrücklich größere Anzahl. Fehlende Einträge werden positioniert, als berechnet markiert und exportiert.')}</p></div>
         <div className="help-row"><b>SVG 6.1</b><p>{t('Use File → Import Fixtures. Each LED becomes its own fixture with current ', 'Für File → Import Fixtures. Jede LED wird als eigenes Fixture mit aktuellen ')}<code>universe</code>, <code>channel</code> {t('and', 'und')} <code>fixture_definition</code> {t('attributes.', 'Attributen angelegt.')}</p></div>
         <div className="help-row"><b>CSV</b><p>{t('A robust table alternative for fixture instances, semicolon-delimited and grouped by panel path.', 'Robuste Tabellenalternative für Fixture-Instanzen. Semikolon-getrennt und mit Gruppenpfaden pro Panel.')}</p></div>
         <div className="help-row"><b>MMFL</b><p>{t('For import in the Fixture Editor. It describes a 2D pixel grid and channel layout. The MadMapper product name is taken from Fixture Definition; multi-panel exports add the panel name for uniqueness. Internal details are not fully documented publicly.', 'Für den Import im Fixture Editor. Das Format beschreibt ein 2D-Pixelraster und die Kanalbelegung. Der MadMapper-Produktname wird aus Fixture Definition übernommen; bei mehreren Panels wird zur Unterscheidung der Panelname ergänzt. Die internen Details sind nicht vollständig öffentlich dokumentiert.')}</p></div>

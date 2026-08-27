@@ -32,7 +32,7 @@ Pixelblaze JSON / Marimapper CSV
 
 - **Source order is stable by default.** Imported LED indices survive clustering, selection, repair, projection, and export. Explicit insertion is the one intentional exception: it creates a new slot and shifts following indices.
 - **Alignment is non-destructive.** A panel stores rotation, scale, and flip flags separately from its 3D points.
-- **Missing CSV slots are recovered automatically.** Sparse indices and blank coordinate rows are placed from average panel spacing, the matrix/zigzag model, and up to four previous/four following measured readings. Inferred points join the panel and export but never train the model.
+- **CSV recovery has explicit bounds.** The first/last source indices define the default normalised scan range, and the user confirms the authoritative LED count before import. No leading pixels are invented; trailing pixels require an explicitly larger count. Sparse indices and blank coordinate rows inside that range are placed from average panel spacing, the matrix/zigzag model, and up to four previous/four following measured readings. Inferred points join the panel and export but never train the model.
 - **Measured repairs are opt-in.** Scanned coordinates are protected by default. Outlier review must be enabled explicitly and only suggests deviations over the selected threshold; coordinates change only after approval.
 - **3D becomes local 2D.** Principal component analysis derives a best-fit plane for each panel. MadMapper exports use coordinates on that plane.
 - **The MMFL preview is export-exact.** The transparent 2D cell overlay and MMFL generator share one quantisation function, so empty preview cells match exported zeros.
