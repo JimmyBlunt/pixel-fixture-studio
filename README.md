@@ -86,7 +86,7 @@ Sparse Marimapper indices are preserved as placeholders so they can be reviewed 
 | --- | --- | --- |
 | SVG 6.1 | Freeform fixture placement | Preserves precise 2D positions, panel groups, and DMX attributes. |
 | CSV | Fixture instance tables | Semicolon-delimited rows with definition, patch, bounds, and group path. |
-| MMFL | Fixture Editor experiments | Quantises each panel onto a 2D grid; verify the result in your MadMapper version. |
+| MMFL | Fixture Editor experiments | Quantises each panel onto a 2D grid. The imported product name comes from **Fixture Definition**; multi-panel exports append the panel name. |
 
 MadMapper fixtures are 2D. Each selected 3D panel is projected onto its own best-fit plane; the source map and LED order remain unchanged.
 
