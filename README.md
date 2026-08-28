@@ -20,8 +20,8 @@ The hosted app currently uses access-controlled Sites hosting. Everyone can run 
 - Automatic spatial panel detection with per-panel enable/disable controls
 - Large 2D alignment workspace with free rotation, axis snap, scaling, and horizontal/vertical flip
 - Automatic placement and export of missing Marimapper indices or blank coordinate rows
-- Matrix- and zigzag-aware repair with measured coordinates protected by default
-- Optional transparent MMFL cell grid in every 2D preview, including empty output cells
+- Conservative matrix- and zigzag-aware repair focused on generated pixels and clear local outliers
+- Compact, collision-free MMFL grids with a working spacing control and export-exact 2D preview
 - MadMapper 6.1 SVG, CSV, and experimental MMFL exports
 - English default interface with instant German translation
 - Local-first processing: map files never leave the browser
@@ -34,9 +34,9 @@ Open the [hosted app](https://pixel-fixture-studio.jimmyblunt44.chatgpt.site/) (
 
 ### 2. Select and align
 
-Choose a detected panel or draw a box around LEDs to create a custom panel. Click a pixel to inspect and edit its X/Y/Z values, search by its one-based pixel number, or enable Edit Mode to move a selection with the arrow keys. `Page Up`/`Page Down` move Z and `Shift` uses a 10× step. New pixels can be inserted into the active panel; following source numbers shift forward.
+Choose a detected panel or draw a box around LEDs to create a custom panel. Click a pixel to inspect and edit its X/Y/Z values, search by its one-based pixel number, or enable Edit Mode to move a selection with the arrow keys. `Page Up`/`Page Down` move Z and `Shift` uses a 10× step. New pixels are inserted on the active panel's best-fit plane; following source numbers shift forward.
 
-Swap the large workspace to 2D to rotate, snap, scale, or flip the fixture before export. Enable the MMFL grid to see the exact quantised cells, including empty cells, that the MMFL export will contain. When differently spaced structures share one panel, the grid resolution increases automatically until every LED has a unique MMFL cell.
+Swap the large workspace to 2D to rotate, snap, scale, or flip the fixture before export. Enable the MMFL grid to see the exact quantised cells, including empty cells, that the MMFL export will contain. Collision handling first preserves every LED, then removes globally empty rows and columns. The size control is applied to that compact integer grid, so it remains visible and effective in the preview and export.
 
 ![Large MadMapper-style 2D alignment view](docs/images/02-2d-alignment.png)
 
@@ -46,7 +46,7 @@ For every Marimapper CSV, an import dialog shows the detected source-index range
 
 Missing indices and rows with empty coordinates inside that bounded scan are positioned automatically. Repeated row turns are evaluated near each missing pixel instead of imposing one matrix width on the whole scan. Row length and row count are independent, so one file can contain arbitrary square and rectangular layouts such as 5×5, 9×9, 8×32, and 32×8 alongside straight strips and free lines. Missing cells are extrapolated from matching columns in neighbouring serpentine rows and checked against the nearest intact pixel in the target row. Automatically inferred pixels are marked in turquoise, included in the active panel and export, and never used to detect the row structure themselves.
 
-Auto Repair protects measured coordinates by default. Scanned outlier review must be enabled explicitly. It combines a conservative large-error threshold with an adjustable local line tolerance that projects subtle deviations onto a line fitted from four intact neighbours. Bends and row turns are rejected, and measured corrections are never preselected: every change requires individual confirmation.
+Auto Repair reviews inferred and manually inserted pixels first while protecting measured coordinates by default. Scanned outlier review must be enabled explicitly. A measured point is proposed only when a clean line fitted from four intact local neighbours and the wider neighbourhood both identify a clear deviation. Normal scan noise, bends, and row turns are rejected. No repair is preselected; every change requires individual confirmation.
 
 ![Auto Repair review with sensitivity and zoom controls](docs/images/03-auto-repair.png)
 

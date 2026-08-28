@@ -4,7 +4,7 @@ import { ChangeEvent, PointerEvent as ReactPointerEvent, useEffect, useMemo, use
 
 type Vec3 = [number, number, number];
 type Language = 'en' | 'de';
-type MapPoint = { sourceIndex: number; xyz: Vec3; status: 'ok' | 'inferred' | 'placeholder' | 'outlier' };
+type MapPoint = { sourceIndex: number; xyz: Vec3; status: 'ok' | 'inferred' | 'manual' | 'placeholder' | 'outlier' };
 type PanelTransform = { rotation: number; scale: number; flipX: boolean; flipY: boolean };
 type Panel = { id: string; name: string; indices: number[]; color: string; enabled: boolean; transform: PanelTransform };
 type Camera = { yaw: number; pitch: number; zoom: number };
@@ -15,7 +15,7 @@ type RepairSuggestion = {
   sourceIndex: number;
   before: Vec3;
   after: Vec3;
-  reason: 'missing-reading' | 'threshold-deviation' | 'local-line-deviation';
+  reason: 'missing-reading' | 'generated-position' | 'threshold-deviation' | 'local-line-deviation';
   confidence: 'high' | 'medium' | 'low';
   deviationRatio: number;
   supportCount: number;
@@ -454,7 +454,7 @@ function estimateExpectedPosition(sourceIndex: number, panel: Panel, points: Map
   return candidates.length ? { position: averageVec(candidates), supportCount: neighbours.length, model: null } : null;
 }
 
-/** Suggest missing readings, large matrix errors, and subtle deviations from a locally straight LED row. */
+/** Suggest generated pixels and only measured points that are clear local outliers. */
 function findRepairSuggestions(panel: Panel, points: MapPoint[], pitch: number, threshold: number, lineThreshold: number, includeMeasured = false): RepairSuggestion[] {
   if (!panel.indices.length) return [];
   const panelSet = new Set(panel.indices);
@@ -463,22 +463,34 @@ function findRepairSuggestions(panel: Panel, points: MapPoint[], pitch: number, 
   const minIndex = sorted[0], maxIndex = sorted[sorted.length - 1];
   return points.slice(minIndex, maxIndex + 1).flatMap<RepairSuggestion>(point => {
     const isMissing = point.status === 'placeholder';
+    const isGenerated = point.status === 'inferred' || point.status === 'manual';
     if (!isMissing && !panelSet.has(point.sourceIndex)) return [];
-    if (point.status === 'inferred' || (!isMissing && !includeMeasured)) return [];
+    if (!isMissing && !isGenerated && !includeMeasured) return [];
     const estimate = estimateExpectedPosition(point.sourceIndex, panel, points, pitch, model);
-    const lineEstimate = !isMissing && includeMeasured ? estimateLocalLinePosition(point.sourceIndex, panel, points, pitch) : null;
+    const lineEstimate = !isMissing && !isGenerated && includeMeasured ? estimateLocalLinePosition(point.sourceIndex, panel, points, pitch) : null;
     if ((!estimate || estimate.supportCount < 2) && !lineEstimate) return [];
     const averagePitch = model?.averagePitch ?? pitch;
     const deviationRatio = isMissing ? Infinity : estimate ? dist(point.xyz, estimate.position) / Math.max(averagePitch, .0001) : 0;
-    const isLineDeviation = Boolean(lineEstimate && lineEstimate.deviationRatio > lineThreshold && lineEstimate.deviationRatio > Math.max(lineEstimate.lineNoiseRatio * 2.25, .004));
-    if (deviationRatio <= threshold && !isLineDeviation) return [];
+    // Generated positions are reviewed when a supported model can improve them. For measured
+    // points, a local straight-line fit is the gate: a broad/global matrix model alone must never
+    // flag a whole valid matrix or a legitimate row turn.
+    if (isGenerated) {
+      if (!estimate || estimate.supportCount < 4 || deviationRatio <= Math.max(lineThreshold, .08)) return [];
+      const confidence: RepairSuggestion['confidence'] = estimate.supportCount >= 6 && model ? 'high' : 'medium';
+      return [{ id: `repair-${point.sourceIndex}`, sourceIndex: point.sourceIndex, before: point.xyz, after: estimate.position, reason: 'generated-position', confidence, deviationRatio, supportCount: estimate.supportCount, selected: false }];
+    }
+    const isLineDeviation = Boolean(lineEstimate
+      && lineEstimate.deviationRatio > lineThreshold
+      && lineEstimate.deviationRatio > Math.max(lineEstimate.lineNoiseRatio * 5, .08)
+      && (!estimate || deviationRatio > threshold));
+    if (!isMissing && !isLineDeviation) return [];
     if (isLineDeviation && lineEstimate) {
-      const confidence: RepairSuggestion['confidence'] = lineEstimate.deviationRatio > Math.max(lineThreshold * 3, lineEstimate.lineNoiseRatio * 5) ? 'high' : lineEstimate.deviationRatio > Math.max(lineThreshold * 1.5, lineEstimate.lineNoiseRatio * 3) ? 'medium' : 'low';
+      const confidence: RepairSuggestion['confidence'] = lineEstimate.deviationRatio > Math.max(lineThreshold * 2, lineEstimate.lineNoiseRatio * 8) ? 'high' : 'medium';
       return [{ id: `repair-${point.sourceIndex}`, sourceIndex: point.sourceIndex, before: point.xyz, after: lineEstimate.position, reason: 'local-line-deviation', confidence, deviationRatio: lineEstimate.deviationRatio, supportCount: lineEstimate.supportCount, selected: false }];
     }
     if (!estimate) return [];
     const confidence: RepairSuggestion['confidence'] = estimate.supportCount >= 6 && model ? 'high' : estimate.supportCount >= 4 ? 'medium' : 'low';
-    return [{ id: `repair-${point.sourceIndex}`, sourceIndex: point.sourceIndex, before: point.xyz, after: estimate.position, reason: isMissing ? 'missing-reading' : 'threshold-deviation', confidence, deviationRatio, supportCount: estimate.supportCount, selected: confidence !== 'low' }];
+    return [{ id: `repair-${point.sourceIndex}`, sourceIndex: point.sourceIndex, before: point.xyz, after: estimate.position, reason: isMissing ? 'missing-reading' : 'threshold-deviation', confidence, deviationRatio, supportCount: estimate.supportCount, selected: false }];
   });
 }
 
@@ -570,42 +582,67 @@ function buildCsv(panels: Panel[], points: MapPoint[], settings: ExportSettings)
   return rows.join('\n') + '\n';
 }
 
-/** Use the same quantised cells for the MMFL file and its transparent preview grid. */
-function quantizePanelGrid(panel: Panel, points: MapPoint[], channels = 3) {
-  const baseProjected = projectPanel(panel, points);
-  const projected = transformProjection(baseProjected, panel.transform);
-  if (!projected.length) return { projected, pitch: 1, uMin: 0, vMin: 0, cells: [] as { x: number; y: number; value: number; sourceIndex: number }[], width: 1, height: 1 };
-  const nearest2d = baseProjected.map((p, i) => Math.min(...baseProjected.filter((_, j) => i !== j).map(q => Math.hypot(p.u - q.u, p.v - q.v)))).filter(Number.isFinite);
-  const basePitch = Math.max(median(nearest2d), .001);
-  const uMin = Math.min(...projected.map(point => point.u));
-  const vMin = Math.min(...projected.map(point => point.v));
-  // A panel may combine sections with different physical spacing. Reduce the cell pitch until
-  // rounding no longer places two LEDs in the same MMFL cell; the old exporter silently dropped
-  // every later LED in such a collision.
-  let pitch = basePitch;
-  let cells = projected.map((point, rank) => ({ x: Math.round((point.u - uMin) / pitch), y: Math.round((point.v - vMin) / pitch), value: 1 + rank * channels, sourceIndex: point.sourceIndex }));
-  for (let attempt = 0; attempt < 24; attempt++) {
-    const occupied = new Set(cells.map(cell => `${cell.x}:${cell.y}`));
-    if (occupied.size === cells.length) break;
-    pitch *= .9;
-    cells = projected.map((point, rank) => ({ x: Math.round((point.u - uMin) / pitch), y: Math.round((point.v - vMin) / pitch), value: 1 + rank * channels, sourceIndex: point.sourceIndex }));
-  }
+type GridCell = { x: number; y: number; value: number; sourceIndex: number };
+
+function makeCellsUnique(cells: GridCell[]) {
   const occupied = new Set<string>();
-  cells = cells.map(cell => {
+  return cells.map(cell => {
     let x = cell.x, y = cell.y, radius = 0;
     while (occupied.has(`${x}:${y}`)) {
       radius += 1;
       const alternatives: [number, number][] = [];
-      for (let delta = -radius; delta <= radius; delta++) alternatives.push([cell.x + delta, cell.y - radius], [cell.x + delta, cell.y + radius], [cell.x - radius, cell.y + delta], [cell.x + radius, cell.y + delta]);
+      for (let delta = -radius; delta <= radius; delta++) alternatives.push(
+        [cell.x + delta, cell.y - radius], [cell.x + delta, cell.y + radius],
+        [cell.x - radius, cell.y + delta], [cell.x + radius, cell.y + delta],
+      );
       const available = alternatives.find(([candidateX, candidateY]) => candidateX >= 0 && candidateY >= 0 && !occupied.has(`${candidateX}:${candidateY}`));
       if (available) [x, y] = available;
     }
     occupied.add(`${x}:${y}`);
     return { ...cell, x, y };
   });
+}
+
+/** Remove globally empty rows and columns without changing LED order or creating collisions. */
+function compactCellAxes(cells: GridCell[]) {
+  const xs = [...new Set(cells.map(cell => cell.x))].sort((a, b) => a - b);
+  const ys = [...new Set(cells.map(cell => cell.y))].sort((a, b) => a - b);
+  const xRank = new Map(xs.map((value, index) => [value, index]));
+  const yRank = new Map(ys.map((value, index) => [value, index]));
+  return cells.map(cell => ({ ...cell, x: xRank.get(cell.x)!, y: yRank.get(cell.y)! }));
+}
+
+/** Use the same compact, collision-free cells for MMFL and its transparent preview grid. */
+function quantizePanelGrid(panel: Panel, points: MapPoint[], channels = 3) {
+  const baseProjected = projectPanel(panel, points);
+  const oriented = transformProjection(baseProjected, panel.transform, false);
+  const projected = transformProjection(baseProjected, panel.transform);
+  if (!projected.length) return { projected, cells: [] as GridCell[], width: 1, height: 1, baseWidth: 1, baseHeight: 1 };
+  const nearest2d = baseProjected.map((p, i) => Math.min(...baseProjected.filter((_, j) => i !== j).map(q => Math.hypot(p.u - q.u, p.v - q.v)))).filter(Number.isFinite);
+  const basePitch = Math.max(median(nearest2d), .001);
+  const uMin = Math.min(...oriented.map(point => point.u));
+  const vMin = Math.min(...oriented.map(point => point.v));
+  // A panel may combine sections with different physical spacing. Reduce the cell pitch until
+  // rounding no longer places two LEDs in the same MMFL cell; the old exporter silently dropped
+  // every later LED in such a collision.
+  let pitch = basePitch;
+  let cells = oriented.map((point, rank) => ({ x: Math.round((point.u - uMin) / pitch), y: Math.round((point.v - vMin) / pitch), value: 1 + rank * channels, sourceIndex: point.sourceIndex }));
+  for (let attempt = 0; attempt < 24; attempt++) {
+    const occupied = new Set(cells.map(cell => `${cell.x}:${cell.y}`));
+    if (occupied.size === cells.length) break;
+    pitch *= .9;
+    cells = oriented.map((point, rank) => ({ x: Math.round((point.u - uMin) / pitch), y: Math.round((point.v - vMin) / pitch), value: 1 + rank * channels, sourceIndex: point.sourceIndex }));
+  }
+  cells = compactCellAxes(makeCellsUnique(cells));
+  const baseWidth = Math.max(...cells.map(cell => cell.x)) + 1;
+  const baseHeight = Math.max(...cells.map(cell => cell.y)) + 1;
+  // Scale the compact integer layout, not the original floating coordinates. This keeps the
+  // 2D size control effective instead of having collision avoidance silently cancel it.
+  cells = makeCellsUnique(cells.map(cell => ({ ...cell, x: Math.round(cell.x * panel.transform.scale), y: Math.round(cell.y * panel.transform.scale) })));
+  if (panel.transform.scale <= 1) cells = compactCellAxes(cells);
   const width = Math.max(...cells.map(cell => cell.x)) + 1;
   const height = Math.max(...cells.map(cell => cell.y)) + 1;
-  return { projected, pitch, uMin, vMin, cells, width, height };
+  return { projected, cells, width, height, baseWidth, baseHeight };
 }
 
 /** Generate an experimental MMFL fixture library using a quantised LED grid. */
@@ -667,7 +704,7 @@ function MapCanvas({ points, panels, selectionMode, showPixelNumbers, selectedIn
       ctx.globalAlpha = 1; ctx.shadowBlur = 0;
       points.filter(p => p.status !== 'ok').forEach(p => {
         const visiblePoint = projectedRef.current.find(q => q.index === p.sourceIndex); if (!visiblePoint) return;
-        ctx.strokeStyle = p.status === 'outlier' ? '#ffb454' : p.status === 'inferred' ? '#49dcb3' : '#5f6a80'; ctx.strokeRect(visiblePoint.x - 4, visiblePoint.y - 4, 8, 8);
+        ctx.strokeStyle = p.status === 'outlier' ? '#ffb454' : p.status === 'manual' ? '#ffd166' : p.status === 'inferred' ? '#49dcb3' : '#5f6a80'; ctx.strokeRect(visiblePoint.x - 4, visiblePoint.y - 4, 8, 8);
       });
       if (box) { ctx.fillStyle = 'rgba(255,79,135,.12)'; ctx.strokeStyle = '#ff4f87'; ctx.setLineDash([5, 4]); ctx.fillRect(box.x1, box.y1, box.x2 - box.x1, box.y2 - box.y1); ctx.strokeRect(box.x1, box.y1, box.x2 - box.x1, box.y2 - box.y1); ctx.setLineDash([]); }
     };
@@ -731,14 +768,26 @@ function FixturePreview({ panel, points, ledSize, interactive = false, showOutpu
       if (showOutputGrid && panel) {
         const grid = quantizePanelGrid(panel, points);
         const occupied = new Set(grid.cells.map(cell => `${cell.x}:${cell.y}`));
-        const cellSize = Math.max(3, grid.pitch * scale * .88);
+        const cellSize = Math.max(3, Math.min(rect.width / (grid.baseWidth + 3), rect.height / (grid.baseHeight + 3)) * .9);
+        const gridCenterX = centerX - (grid.width - 1) * cellSize / 2;
+        const gridCenterY = centerY - (grid.height - 1) * cellSize / 2;
         for (let row = 0; row < grid.height; row++) for (let column = 0; column < grid.width; column++) {
-          const x = centerX + (grid.uMin + column * grid.pitch) * scale;
-          const y = centerY + (grid.vMin + row * grid.pitch) * scale;
+          const x = gridCenterX + column * cellSize;
+          const y = gridCenterY + row * cellSize;
           ctx.fillStyle = occupied.has(`${column}:${row}`) ? 'rgba(140,124,255,.12)' : 'rgba(140,124,255,.035)';
           ctx.strokeStyle = occupied.has(`${column}:${row}`) ? 'rgba(184,174,255,.5)' : 'rgba(140,124,255,.22)';
           ctx.lineWidth = 1; ctx.fillRect(x - cellSize / 2, y - cellSize / 2, cellSize, cellSize); ctx.strokeRect(x - cellSize / 2, y - cellSize / 2, cellSize, cellSize);
         }
+        const cellByIndex = new Map(grid.cells.map(cell => [cell.sourceIndex, cell]));
+        projected.forEach((point, index) => {
+          const cell = cellByIndex.get(point.sourceIndex); if (!cell) return;
+          const x = gridCenterX + cell.x * cellSize, y = gridCenterY + cell.y * cellSize;
+          ctx.fillStyle = panel.color; ctx.shadowColor = panel.color; ctx.shadowBlur = interactive ? 7 : 4; ctx.globalAlpha = .62 + .38 * index / projected.length;
+          const size = Math.max(2.4, Math.min(cellSize * .65, ledSize / (interactive ? 1.5 : 2.5)));
+          ctx.fillRect(x - size / 2, y - size / 2, size, size);
+        });
+        ctx.globalAlpha = 1; ctx.shadowBlur = 0;
+        return;
       }
       projected.forEach((point, index) => {
         const x = centerX + point.u * scale, y = centerY + point.v * scale;
@@ -842,8 +891,8 @@ export default function Home() {
   const [pendingImport, setPendingImport] = useState<{ parsed: ParsedMap; fileName: string } | null>(null);
   const [expectedLedCount, setExpectedLedCount] = useState('');
   const [repairSuggestions, setRepairSuggestions] = useState<RepairSuggestion[]>([]);
-  const [repairThreshold, setRepairThreshold] = useState(2.5);
-  const [lineRepairThreshold, setLineRepairThreshold] = useState(.05);
+  const [repairThreshold, setRepairThreshold] = useState(1.25);
+  const [lineRepairThreshold, setLineRepairThreshold] = useState(.35);
   const [includeMeasuredRepairs, setIncludeMeasuredRepairs] = useState(false);
   const [repairZoom, setRepairZoom] = useState(1);
   const [settings, setSettings] = useState<ExportSettings>({ universe: 0, channel: 1, channels: 3, ledSize: 6, definition: 'Generic - Pixel RGB' });
@@ -874,7 +923,7 @@ export default function Home() {
       if (!delta) return;
       event.preventDefault();
       const selected = new Set(selection);
-      setPoints(items => items.map(point => selected.has(point.sourceIndex) ? { ...point, xyz: add(point.xyz, delta), status: 'ok' } : point));
+      setPoints(items => items.map(point => selected.has(point.sourceIndex) ? { ...point, xyz: add(point.xyz, delta), status: 'manual' } : point));
       setRepairSuggestions([]);
       setMessage(translated(language, `${selection.length} pixel${selection.length === 1 ? '' : 's'} moved.`, `${selection.length} Pixel verschoben.`));
     };
@@ -962,13 +1011,13 @@ export default function Home() {
   const moveSelected = (delta: Vec3) => {
     if (!selection.length) return;
     const selected = new Set(selection);
-    setPoints(items => items.map(point => selected.has(point.sourceIndex) ? { ...point, xyz: add(point.xyz, delta), status: 'ok' } : point));
+    setPoints(items => items.map(point => selected.has(point.sourceIndex) ? { ...point, xyz: add(point.xyz, delta), status: 'manual' } : point));
     setRepairSuggestions([]);
     setMessage(t(`${selection.length} pixel${selection.length === 1 ? '' : 's'} moved.`, `${selection.length} Pixel verschoben.`));
   };
   const updateCoordinate = (axis: 0 | 1 | 2, value: number) => {
     if (!selectedPoint || !Number.isFinite(value)) return;
-    setPoints(items => items.map(point => point.sourceIndex === selectedPoint.sourceIndex ? { ...point, xyz: point.xyz.map((coordinate, index) => index === axis ? value : coordinate) as Vec3, status: 'ok' } : point));
+    setPoints(items => items.map(point => point.sourceIndex === selectedPoint.sourceIndex ? { ...point, xyz: point.xyz.map((coordinate, index) => index === axis ? value : coordinate) as Vec3, status: 'manual' } : point));
     setRepairSuggestions([]);
   };
   const searchForPixel = () => {
@@ -978,17 +1027,29 @@ export default function Home() {
   };
   const insertPixel = () => {
     if (!active) return;
-    const fallback = selectedPoint ? selectedPoint.sourceIndex + 2 : points.length + 1;
-    const requested = insertAt.trim() ? Math.trunc(Number(insertAt)) : fallback;
+    const fallbackIndex = selectedPoint ? selectedPoint.sourceIndex + 2 : points.length + 1;
+    const requested = insertAt.trim() ? Math.trunc(Number(insertAt)) : fallbackIndex;
     if (!Number.isInteger(requested) || requested < 1 || requested > points.length + 1) { setError(t(`Choose a position between 1 and ${points.length + 1}.`, `Wähle eine Position zwischen 1 und ${points.length + 1}.`)); return; }
-    const index = requested - 1, before = points[index - 1], after = points[index];
-    const xyz: Vec3 = before && after ? averageVec([before.xyz, after.xyz]) : before && points[index - 2] ? add(before.xyz, sub(before.xyz, points[index - 2].xyz)) : after ? after.xyz : [0, 0, 0];
-    const inserted: MapPoint = { sourceIndex: index, xyz, status: 'ok' };
-    setPoints(items => [...items.slice(0, index), inserted, ...items.slice(index)].map((point, sourceIndex) => ({ ...point, sourceIndex })));
-    setPanels(items => items.map(panel => {
+    const index = requested - 1;
+    const shiftedPoints = points.map(point => ({ ...point, sourceIndex: point.sourceIndex >= index ? point.sourceIndex + 1 : point.sourceIndex }));
+    const fallbackBefore = shiftedPoints[index - 1], fallbackAfter = shiftedPoints[index];
+    const fallbackPosition: Vec3 = fallbackBefore && fallbackAfter ? averageVec([fallbackBefore.xyz, fallbackAfter.xyz]) : fallbackBefore ? fallbackBefore.xyz : fallbackAfter?.xyz ?? [0, 0, 0];
+    const withPlaceholder: MapPoint[] = [...shiftedPoints.slice(0, index), { sourceIndex: index, xyz: fallbackPosition, status: 'manual' }, ...shiftedPoints.slice(index)];
+    const shiftedPanels = panels.map(panel => {
       const shifted = panel.indices.map(pixelIndex => pixelIndex >= index ? pixelIndex + 1 : pixelIndex);
       return panel.id === active.id ? { ...panel, indices: [...new Set([...shifted, index])].sort((a, b) => a - b) } : { ...panel, indices: shifted };
-    }));
+    });
+    const shiftedActive = shiftedPanels.find(panel => panel.id === active.id)!;
+    const model = buildMatrixModel(shiftedActive, withPlaceholder, pitch);
+    const estimate = estimateExpectedPosition(index, shiftedActive, withPlaceholder, pitch, model);
+    const serpentine = estimateSerpentinePosition(index, shiftedActive, withPlaceholder, pitch);
+    const basis = getPanelBasis(shiftedActive, withPlaceholder);
+    const candidate = serpentine ?? estimate?.position ?? model?.positionAt(index) ?? fallbackPosition;
+    const projectedCandidate = basis ? projectXyz(candidate, basis) : null;
+    const xyz = basis && projectedCandidate ? add(basis.center, add(scaleVec(basis.e1, projectedCandidate.u), scaleVec(basis.e2, -projectedCandidate.v))) : candidate;
+    const nextPoints = withPlaceholder.map(point => point.sourceIndex === index ? { ...point, xyz } : point);
+    setPoints(nextPoints);
+    setPanels(shiftedPanels);
     setSelection([index]); setPixelSearch(String(requested)); setInsertAt(''); setRepairSuggestions([]); setError('');
     setMessage(t(`Pixel ${requested} inserted into ${active.name}; following numbers were shifted.`, `Pixel ${requested} wurde in ${active.name} eingefügt; folgende Nummern wurden verschoben.`));
   };
@@ -1029,8 +1090,8 @@ export default function Home() {
     setRepairZoom(1);
     setShowRepair(true);
     setMessage(suggestions.length
-      ? t(`${suggestions.length} possible measurement errors found in ${active.name} — no data has been changed.`, `${suggestions.length} mögliche Messfehler in ${active.name} gefunden — noch nichts verändert.`)
-      : includeMeasuredRepairs ? t(`${active.name}: no measured pixel exceeds ${repairThreshold.toFixed(2)} × average spacing.`, `${active.name}: kein gemessenes Pixel überschreitet ${repairThreshold.toFixed(2)} × mittleren Abstand.`) : t(`${active.name}: no unresolved missing pixels. Measured coordinates remain protected.`, `${active.name}: keine ungelösten fehlenden Pixel. Gemessene Koordinaten bleiben geschützt.`));
+      ? t(`${suggestions.length} conservative repair suggestion${suggestions.length === 1 ? '' : 's'} found in ${active.name} — no data has been changed.`, `${suggestions.length} konservative Reparaturvorschläge in ${active.name} gefunden — noch nichts verändert.`)
+      : includeMeasuredRepairs ? t(`${active.name}: no generated pixel or clear measured outlier exceeds the thresholds.`, `${active.name}: Kein erzeugtes Pixel und kein eindeutiger gemessener Ausreißer überschreitet die Schwellwerte.`) : t(`${active.name}: no generated pixel needs correction. Measured coordinates remain protected.`, `${active.name}: Kein erzeugtes Pixel benötigt eine Korrektur. Gemessene Koordinaten bleiben geschützt.`));
   };
   const changeRepairThreshold = (next: number) => {
     setRepairThreshold(next);
@@ -1051,7 +1112,7 @@ export default function Home() {
     if (!active) return;
     const suggestions = findRepairSuggestions(active, points, pitch, repairThreshold, lineRepairThreshold, next);
     setRepairSuggestions(suggestions);
-    setMessage(next ? t('Measured outlier review enabled. No coordinates change without confirmation.', 'Prüfung gemessener Ausreißer aktiviert. Ohne Bestätigung werden keine Koordinaten verändert.') : t('Measured coordinates protected; only unresolved missing pixels are reviewed.', 'Gemessene Koordinaten geschützt; geprüft werden nur ungelöste fehlende Pixel.'));
+    setMessage(next ? t('Strict measured-outlier review enabled. Normal scan noise and row turns remain protected.', 'Strenge Prüfung gemessener Ausreißer aktiviert. Normales Scanrauschen und Zeilenwechsel bleiben geschützt.') : t('Measured coordinates protected; only inferred or manually added pixels are reviewed.', 'Gemessene Koordinaten geschützt; geprüft werden nur berechnete oder manuell hinzugefügte Pixel.'));
   };
   const applyRepairs = () => {
     if (!active) return;
@@ -1078,6 +1139,7 @@ export default function Home() {
   };
   const repairReason = (reason: RepairSuggestion['reason']) => ({
     'missing-reading': t('Missing reading', 'Fehlender Messwert'),
+    'generated-position': t('Generated or manually edited pixel', 'Erzeugtes oder manuell bearbeitetes Pixel'),
     'threshold-deviation': t('Deviation above threshold', 'Abweichung über Schwellwert'),
     'local-line-deviation': t('Local row/line deviation', 'Lokale Zeilen-/Linienabweichung'),
   }[reason]);
@@ -1206,15 +1268,15 @@ export default function Home() {
       </section></div>}
 
       {showRepair && active && <div className="modal-backdrop" onMouseDown={() => setShowRepair(false)}><section className="modal repair-modal" onMouseDown={event => event.stopPropagation()} aria-modal="true" role="dialog" aria-labelledby="repair-title">
-        <button className="modal-close" aria-label={t('Close', 'Schließen')} onClick={() => setShowRepair(false)}>×</button><span className="eyebrow">{t('AUTO REPAIR · REVIEW', 'AUTO-REPAIR · VORSCHAU')}</span><h2 id="repair-title">{t('Review unresolved pixels', 'Ungelöste Pixel kontrollieren')}</h2><p className="modal-lead">{t('Missing CSV pixels are positioned automatically during import and marked in turquoise. Measured coordinates are protected unless you explicitly include them below.', 'Fehlende CSV-Pixel werden bereits beim Import automatisch positioniert und türkis markiert. Gemessene Koordinaten sind geschützt, solange du sie unten nicht ausdrücklich einbeziehst.')}</p>
-        <div className="repair-protection"><label><input type="checkbox" checked={includeMeasuredRepairs} onChange={event => changeMeasuredRepairMode(event.target.checked)} /><span><strong>{t('Include measured outliers', 'Gemessene Ausreißer einbeziehen')}</strong><small>{t('Off by default. Enabling this can propose changes to scanned coordinates, but still requires confirmation.', 'Standardmäßig aus. Aktivieren kann Änderungen an gemessenen Koordinaten vorschlagen; jede Änderung muss weiterhin bestätigt werden.')}</small></span></label></div>
-        <div className="repair-toolbar"><div className="repair-thresholds"><label className={!includeMeasuredRepairs ? 'disabled-control' : ''}>{t('Large matrix deviation', 'Große Matrixabweichung')}<div className="threshold-control"><input disabled={!includeMeasuredRepairs} aria-label={t('Deviation threshold in average pixel spacings', 'Abweichungsschwellwert in mittleren Pixelabständen')} type="range" min="1" max="6" step="0.1" value={repairThreshold} onChange={event => changeRepairThreshold(Number(event.target.value))} /><output>{repairThreshold.toFixed(1)} ×</output></div></label><label className={!includeMeasuredRepairs ? 'disabled-control' : ''}>{t('Local line tolerance', 'Lokale Linientoleranz')}<div className="threshold-control"><input disabled={!includeMeasuredRepairs} aria-label={t('Local line tolerance as part of average spacing', 'Lokale Linientoleranz als Anteil des mittleren Abstands')} type="range" min="0.005" max="0.25" step="0.005" value={lineRepairThreshold} onChange={event => changeLineRepairThreshold(Number(event.target.value))} /><output>{(lineRepairThreshold * 100).toFixed(1)} %</output></div><small>{t('Lower values find subtler alignment errors; proposed measured changes are never preselected.', 'Kleinere Werte finden feinere Ausrichtungsfehler; Änderungen an Messwerten sind nie vorausgewählt.')}</small></label></div><div className="repair-zoom"><button aria-label={t('Zoom out', 'Verkleinern')} onClick={() => setRepairZoom(value => Math.max(1, value - .5))}>−</button><input aria-label={t('Repair preview zoom', 'Zoom der Reparaturvorschau')} type="range" min="1" max="8" step="0.1" value={repairZoom} onChange={event => setRepairZoom(Number(event.target.value))} /><output>{Math.round(repairZoom * 100)} %</output><button aria-label={t('Zoom in', 'Vergrößern')} onClick={() => setRepairZoom(value => Math.min(8, value + .5))}>＋</button></div></div>
+        <button className="modal-close" aria-label={t('Close', 'Schließen')} onClick={() => setShowRepair(false)}>×</button><span className="eyebrow">{t('AUTO REPAIR · REVIEW', 'AUTO-REPAIR · VORSCHAU')}</span><h2 id="repair-title">{t('Review generated pixels and clear outliers', 'Erzeugte Pixel und eindeutige Ausreißer prüfen')}</h2><p className="modal-lead">{t('Inferred and manually inserted pixels are checked first. Measured coordinates stay protected unless you explicitly enable the strict outlier check below.', 'Berechnete und manuell hinzugefügte Pixel werden zuerst geprüft. Gemessene Koordinaten bleiben geschützt, solange du die strenge Ausreißerprüfung unten nicht ausdrücklich aktivierst.')}</p>
+        <div className="repair-protection"><label><input type="checkbox" checked={includeMeasuredRepairs} onChange={event => changeMeasuredRepairMode(event.target.checked)} /><span><strong>{t('Include clear measured outliers', 'Eindeutige gemessene Ausreißer einbeziehen')}</strong><small>{t('Off by default. A measured LED is suggested only when both the local line and the wider neighbourhood identify it as an outlier. Nothing is preselected.', 'Standardmäßig aus. Eine gemessene LED wird nur vorgeschlagen, wenn sowohl die lokale Linie als auch die weitere Nachbarschaft sie als Ausreißer erkennen. Nichts wird vorausgewählt.')}</small></span></label></div>
+        <div className="repair-toolbar"><div className="repair-thresholds"><label className={!includeMeasuredRepairs ? 'disabled-control' : ''}>{t('Wider-neighbour deviation', 'Abweichung zur weiteren Nachbarschaft')}<div className="threshold-control"><input disabled={!includeMeasuredRepairs} aria-label={t('Deviation threshold in average pixel spacings', 'Abweichungsschwellwert in mittleren Pixelabständen')} type="range" min="0.75" max="6" step="0.05" value={repairThreshold} onChange={event => changeRepairThreshold(Number(event.target.value))} /><output>{repairThreshold.toFixed(2)} ×</output></div></label><label className={!includeMeasuredRepairs ? 'disabled-control' : ''}>{t('Local outlier deviation', 'Lokale Ausreißerabweichung')}<div className="threshold-control"><input disabled={!includeMeasuredRepairs} aria-label={t('Local outlier threshold as part of average spacing', 'Lokaler Ausreißerschwellwert als Anteil des mittleren Abstands')} type="range" min="0.15" max="2" step="0.05" value={lineRepairThreshold} onChange={event => changeLineRepairThreshold(Number(event.target.value))} /><output>{(lineRepairThreshold * 100).toFixed(0)} %</output></div><small>{t('Conservative default: normal scan noise, curves and row turns are ignored.', 'Konservative Voreinstellung: Normales Scanrauschen, Kurven und Zeilenwechsel werden ignoriert.')}</small></label></div><div className="repair-zoom"><button aria-label={t('Zoom out', 'Verkleinern')} onClick={() => setRepairZoom(value => Math.max(1, value - .5))}>−</button><input aria-label={t('Repair preview zoom', 'Zoom der Reparaturvorschau')} type="range" min="1" max="8" step="0.1" value={repairZoom} onChange={event => setRepairZoom(Number(event.target.value))} /><output>{Math.round(repairZoom * 100)} %</output><button aria-label={t('Zoom in', 'Vergrößern')} onClick={() => setRepairZoom(value => Math.min(8, value + .5))}>＋</button></div></div>
         {repairModel && <div className="matrix-summary"><span>{t('Local pattern detection', 'Lokale Mustererkennung')}: <b>{t('active', 'aktiv')}</b></span><span>{t('Mixed matrices and straight strips', 'Gemischte Matrizen und gerade Streifen')}</span><span>{t('Average spacing', 'Mittlerer Abstand')}: <b>{repairModel.averagePitch.toFixed(3)}</b></span></div>}
         <RepairPreview language={language} key={active.id} panel={active} points={points} suggestions={repairSuggestions} zoom={repairZoom} onZoomChange={setRepairZoom} />
         <div className="repair-pan-hint">{t('Drag: pan · Wheel: zoom · Double-click: centre', 'Ziehen: Ausschnitt verschieben · Mausrad: zoomen · Doppelklick: zentrieren')}</div>
         <div className="repair-legend"><span><i className="original" /> {t('Original', 'Original')}</span><span><i className="proposed" /> {t('Proposed', 'Vorschlag')}</span><span>{selectedRepairCount}/{repairSuggestions.length} {t('selected', 'ausgewählt')}</span></div>
         <div className="repair-list">{repairSuggestions.length ? repairSuggestions.map(suggestion => <label className={`repair-row ${suggestion.selected ? 'selected' : ''}`} key={suggestion.id}><input type="checkbox" checked={suggestion.selected} onChange={() => setRepairSuggestions(items => items.map(item => item.id === suggestion.id ? { ...item, selected: !item.selected } : item))} /><span className="repair-index">#{suggestion.sourceIndex + 1}</span><span className="repair-copy"><strong>{repairReason(suggestion.reason)}</strong><small>{suggestion.before.map(value => value.toFixed(2)).join(' / ')} → {suggestion.after.map(value => value.toFixed(2)).join(' / ')} · {Number.isFinite(suggestion.deviationRatio) ? `${suggestion.deviationRatio.toFixed(3)} ×` : '∞'} · {suggestion.supportCount} {t('neighbours', 'Nachbarn')}</small></span><span className={`confidence ${suggestion.confidence}`}>{confidenceLabel(suggestion.confidence)}</span></label>) : <div className="repair-empty">{includeMeasuredRepairs ? t('No measured pixel exceeds the selected local or matrix threshold.', 'Kein gemessenes Pixel überschreitet den lokalen oder Matrix-Schwellwert.') : t('All missing CSV pixels that could be calculated were already positioned automatically. Measured coordinates remain unchanged.', 'Alle berechenbaren fehlenden CSV-Pixel wurden bereits automatisch positioniert. Gemessene Koordinaten bleiben unverändert.')}</div>}</div>
-        <div className="repair-note">{t('Missing CSV positions use the matrix/zigzag pattern detected nearest that pixel, so different matrix sizes can coexist. Measured line corrections use four intact local neighbours, reject bends and row turns, and always require manual selection.', 'Fehlende CSV-Positionen nutzen das Matrix-/Zickzack-Muster direkt in der Nähe des Pixels, sodass verschiedene Matrixgrößen gemeinsam vorkommen können. Linienkorrekturen für Messwerte nutzen vier intakte lokale Nachbarn, verwerfen Kurven und Zeilenwechsel und müssen immer manuell ausgewählt werden.')}</div>
+        <div className="repair-note">{t('Generated pixels use the nearest supported matrix or zigzag pattern. Measured LEDs require agreement between four intact line neighbours and the wider neighbourhood; bends and row turns are rejected. Every change must be selected manually.', 'Erzeugte Pixel nutzen das nächste ausreichend belegte Matrix- oder Zickzack-Muster. Gemessene LEDs benötigen Übereinstimmung zwischen vier intakten Liniennachbarn und der weiteren Nachbarschaft; Kurven und Zeilenwechsel werden verworfen. Jede Änderung muss manuell ausgewählt werden.')}</div>
         <div className="modal-actions"><button className="secondary-button" onClick={() => { setShowRepair(false); setRepairSuggestions([]); setMessage(t('Repair suggestions discarded — original data unchanged.', 'Reparaturvorschläge verworfen — Originaldaten unverändert.')); }}>{t('Cancel', 'Abbrechen')}</button><button className="primary-button repair-apply" disabled={!selectedRepairCount} onClick={applyRepairs}>{t(`Apply ${selectedRepairCount} selected`, `${selectedRepairCount} ausgewählte anwenden`)}</button></div>
       </section></div>}
 
