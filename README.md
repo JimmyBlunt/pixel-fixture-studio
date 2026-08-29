@@ -20,6 +20,7 @@ The hosted app currently uses access-controlled Sites hosting. Everyone can run 
 - Automatic placement and export of missing Marimapper indices or blank coordinate rows
 - Modular fixture builder for matrices of any dimensions, arbitrary strips, and individual LEDs
 - Scan-assisted zigzag, row/column flow, and start-corner detection with manual overrides
+- Immediate module draft after CSV import: repeated row returns become matrices, serpentine reversals determine likely row length, and unmatched runs remain strips
 - Per-module X/Y placement, physical width/height, rotation, and an export-exact MMFL preview
 - Strict coverage rules: each imported LED slot is assigned once, and only modules that fit a remaining contiguous range can be added
 - Reserved hidden LEDs remain part of the wiring order and DMX address spacing without rendering a visible MMFL cell
@@ -47,7 +48,7 @@ Drag complete modules in the large 2D builder, then enter exact X/Y positions, p
 
 Pixels that exist physically but must never light can be marked hidden on their module. A hidden pixel stays visible as a crossed placeholder in the editor and continues to consume its source index and channel offset. The MMFL cell is written as `0`; every later mapped cell is still calculated from its original source index. This is the compatibility approach used because MMFL does not publicly document a dedicated hidden-pixel flag.
 
-For every Marimapper CSV, the import dialog still shows the detected source-index range, measured count, and internal gaps, then asks for the authoritative total LED count. No leading LEDs are invented, and trailing LEDs are added only when the entered total explicitly requires them.
+For every Marimapper CSV, the import dialog shows the detected source-index range, measured count, and the exact missing indices, then asks for the authoritative physical LED count. If a file starts above index 0, the user can preserve those leading source slots as missing LEDs; the app recommends this when the first observed matrix row is incomplete. Immediately after import, repeated row-return distances and serpentine direction reversals generate an editable module draft and open the complete MMFL preview.
 
 ### 4. Export
 

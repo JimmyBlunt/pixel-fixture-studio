@@ -377,6 +377,87 @@ function detectModuleWiring(module: PixelModule, points: MapPoint[], panels: Pan
   };
 }
 
+/**
+ * Build an editable first draft from the measured index path. Large, regularly repeated
+ * return jumps describe row-major matrices; close direction reversals describe serpentine
+ * matrices. Isolated runs remain strips. The result always covers every confirmed slot once.
+ */
+function suggestModulesFromScan(points: MapPoint[], panels: Panel[], pitch: number) {
+  if (!points.length) return [] as PixelModule[];
+  const resetEdges: { after: number; distance: number }[] = [];
+  for (let index = 0; index < points.length - 1; index++) {
+    const current = points[index], next = points[index + 1];
+    // Calculated placeholders must not create artificial panel boundaries.
+    if (!current || !next || current.status !== 'ok' || next.status !== 'ok') continue;
+    const distance = dist(current.xyz, next.xyz);
+    if (distance > pitch * 2.2) resetEdges.push({ after: index, distance });
+  }
+
+  const resetByIndex = new Map(resetEdges.map(edge => [edge.after, edge.distance]));
+  const runs: { first: number; last: number; length: number }[] = [];
+  let first = 0;
+  resetEdges.forEach(edge => {
+    runs.push({ first, last: edge.after, length: edge.after - first + 1 });
+    first = edge.after + 1;
+  });
+  runs.push({ first, last: points.length - 1, length: points.length - first });
+
+  const drafts: { first: number; count: number; rows: number; columns: number; zigzag: boolean; confidence: 'high' | 'medium' }[] = [];
+  for (let offset = 0; offset < runs.length;) {
+    const start = runs[offset];
+    const resetDistances: number[] = [];
+    let endOffset = offset;
+    while (endOffset + 1 < runs.length && runs[endOffset + 1].length === start.length) {
+      const distance = resetByIndex.get(runs[endOffset].last) ?? 0;
+      const typical = resetDistances.length ? median(resetDistances) : distance;
+      if (resetDistances.length >= 2 && (distance > typical * 1.25 || distance < typical * .72)) break;
+      resetDistances.push(distance);
+      endOffset++;
+    }
+    const repeatedRows = endOffset - offset + 1;
+    if (repeatedRows >= 2 && start.length >= 2) {
+      const last = runs[endOffset].last;
+      drafts.push({ first: start.first, count: last - start.first + 1, rows: repeatedRows, columns: start.length, zigzag: false, confidence: repeatedRows >= 3 ? 'high' : 'medium' });
+      offset = endOffset + 1;
+      continue;
+    }
+
+    const indices = Array.from({ length: start.length }, (_, index) => start.first + index);
+    const scanPanel: Panel = { id: `suggest-${start.first}`, name: 'Suggestion', indices, color: COLORS[drafts.length % COLORS.length], enabled: true, transform: { rotation: 0, scale: 1, flipX: false, flipY: false } };
+    const serpentine = detectSerpentineLayout(scanPanel, points, pitch, start.first + Math.floor(start.length / 2));
+    if (serpentine && serpentine.rowLength >= 2 && start.length % serpentine.rowLength === 0 && start.length / serpentine.rowLength >= 2) {
+      drafts.push({ first: start.first, count: start.length, rows: start.length / serpentine.rowLength, columns: serpentine.rowLength, zigzag: true, confidence: 'high' });
+    } else {
+      drafts.push({ first: start.first, count: start.length, rows: 1, columns: start.length, zigzag: false, confidence: 'medium' });
+    }
+    offset++;
+  }
+
+  let cursorX = 0, cursorY = 0, shelfHeight = 0;
+  return drafts.map((draft, index) => {
+    const kind: PixelModuleKind = draft.rows > 1 ? 'matrix' : draft.columns > 1 ? 'strip' : 'single';
+    let module = makeModule(
+      draft.rows > 1 ? `${draft.rows}×${draft.columns} ${translated('en', 'Suggested matrix', 'Vorgeschlagene Matrix')}` : `${draft.columns} LED Suggested strip`,
+      kind,
+      draft.first,
+      draft.rows,
+      draft.columns,
+      index,
+    );
+    module = detectModuleWiring(module, points, panels, pitch);
+    module = { ...module, zigzag: draft.zigzag, wiringDetected: draft.confidence === 'high' || module.wiringDetected };
+    if (cursorX > 0 && cursorX + module.width > 64) {
+      cursorX = 0;
+      cursorY += shelfHeight + 4;
+      shelfHeight = 0;
+    }
+    module = { ...module, x: cursorX, y: cursorY };
+    cursorX += module.width + 4;
+    shelfHeight = Math.max(shelfHeight, module.height);
+    return module;
+  });
+}
+
 function buildModuleMmfl(modules: PixelModule[], total: number, settings: ExportSettings) {
   const ranges = unassignedRanges(modules, total);
   if (ranges.length) throw new Error(`Assign all LED slots before MMFL export. ${ranges.reduce((sum, range) => sum + range.last - range.first + 1, 0)} remain unassigned.`);
@@ -1149,6 +1230,7 @@ export default function Home() {
   const [showRepair, setShowRepair] = useState(false);
   const [pendingImport, setPendingImport] = useState<{ parsed: ParsedMap; fileName: string } | null>(null);
   const [expectedLedCount, setExpectedLedCount] = useState('');
+  const [preserveCsvOrigin, setPreserveCsvOrigin] = useState(false);
   const [repairSuggestions, setRepairSuggestions] = useState<RepairSuggestion[]>([]);
   const [repairThreshold, setRepairThreshold] = useState(1.25);
   const [lineRepairThreshold, setLineRepairThreshold] = useState(.35);
@@ -1211,19 +1293,25 @@ export default function Home() {
     setMessage(next === 'en' ? 'Language changed to English.' : 'Sprache auf Deutsch umgestellt.');
   };
 
-  const applyParsedMap = (parsed: ParsedMap, importedFileName: string, requestedCount = parsed.coords.length) => {
+  const applyParsedMap = (parsed: ParsedMap, importedFileName: string, requestedCount = parsed.coords.length, includeLeadingIndices = false) => {
     const count = Math.trunc(requestedCount);
-    if (!Number.isInteger(count) || count < parsed.coords.length || count > 20000) throw new Error(t(`Choose an LED count between ${parsed.coords.length} and 20,000.`, `Wähle eine LED-Anzahl zwischen ${parsed.coords.length} und 20.000.`));
-    const coords = Array.from({ length: count }, (_, index) => parsed.coords[index] ?? [0, 0, 0] as Vec3);
-    const missingIndices = new Set(parsed.missingIndices);
-    for (let index = parsed.coords.length; index < count; index++) missingIndices.add(index);
+    const leadingCount = includeLeadingIndices && parsed.sourceRange ? parsed.sourceRange[0] : 0;
+    const minimumCount = parsed.coords.length + leadingCount;
+    if (!Number.isInteger(count) || count < minimumCount || count > 20000) throw new Error(t(`Choose an LED count between ${minimumCount} and 20,000.`, `Wähle eine LED-Anzahl zwischen ${minimumCount} und 20.000.`));
+    const coords = Array.from({ length: count }, (_, index) => index < leadingCount ? [0, 0, 0] as Vec3 : parsed.coords[index - leadingCount] ?? [0, 0, 0] as Vec3);
+    const missingIndices = new Set<number>([
+      ...Array.from({ length: leadingCount }, (_, index) => index),
+      ...[...parsed.missingIndices].map(index => index + leadingCount),
+    ]);
+    for (let index = minimumCount; index < count; index++) missingIndices.add(index);
     const analyzed = analyze(coords, missingIndices);
     if (!analyzed.panels.length) throw new Error(t('No connected LED regions were detected. Use a clean scan or select points manually.', 'Keine zusammenhängenden LED-Bereiche erkannt. Nutze eine sauber gescannte Map oder wähle Punkte manuell.'));
     const recovered = missingIndices.size ? placeMissingCoordinates(analyzed.points, analyzed.panels, analyzed.pitch, missingIndices) : { points: analyzed.points, panels: analyzed.panels, placed: 0, unresolved: 0 };
     setPoints(recovered.points);
     setPanels(recovered.panels);
-    setModules([]);
-    setActiveModuleId('');
+    const suggestions = suggestModulesFromScan(recovered.points, recovered.panels, analyzed.pitch);
+    setModules(suggestions);
+    setActiveModuleId(suggestions[0]?.id ?? '');
     setActiveId(recovered.panels[0].id);
     setPitch(analyzed.pitch);
     setFileName(importedFileName);
@@ -1234,14 +1322,14 @@ export default function Home() {
     setRepairZoom(1);
     setShowRepair(false);
     setShowAdjust(false);
-    setStageMode('3d');
+    setStageMode(suggestions.length ? 'builder' : '3d');
     setIncludeMeasuredRepairs(false);
     setPendingImport(null);
     setError('');
     const gapInfo = missingIndices.size ? t(` · ${recovered.placed} missing indices positioned automatically${recovered.unresolved ? ` · ${recovered.unresolved} unresolved` : ''}`, ` · ${recovered.placed} fehlende Indizes automatisch positioniert${recovered.unresolved ? ` · ${recovered.unresolved} ungelöst` : ''}`) : '';
     setMessage(t(
-      `${parsed.sourceLabel}: ${numberFormat.format(coords.length)} slots loaded · ${recovered.panels.length} panels detected${gapInfo}.`,
-      `${parsed.sourceLabel}: ${numberFormat.format(coords.length)} Slots geladen · ${recovered.panels.length} Panels erkannt${gapInfo}.`,
+      `${parsed.sourceLabel}: ${numberFormat.format(coords.length)} slots loaded · ${suggestions.length} editable module suggestions created${gapInfo}.`,
+      `${parsed.sourceLabel}: ${numberFormat.format(coords.length)} Slots geladen · ${suggestions.length} bearbeitbare Modulvorschläge erstellt${gapInfo}.`,
     ));
   };
 
@@ -1257,7 +1345,9 @@ export default function Home() {
       if (parsed.coords.length > 20000) throw new Error(t('The interactive preview supports up to 20,000 LEDs.', 'Für die interaktive Vorschau sind maximal 20.000 LEDs vorgesehen.'));
       if (isCsv) {
         setPendingImport({ parsed, fileName: file.name });
-        setExpectedLedCount(String(parsed.coords.length));
+        const likelyLeadingGap = Boolean(parsed.sourceRange && parsed.sourceRange[0] > 0 && parsed.sourceRange[0] <= 16);
+        setPreserveCsvOrigin(likelyLeadingGap);
+        setExpectedLedCount(String(parsed.coords.length + (likelyLeadingGap ? parsed.sourceRange![0] : 0)));
         setError('');
       } else applyParsedMap(parsed, file.name);
     } catch (cause) {
@@ -1268,7 +1358,7 @@ export default function Home() {
 
   const confirmCsvImport = () => {
     if (!pendingImport) return;
-    try { applyParsedMap(pendingImport.parsed, pendingImport.fileName, Number(expectedLedCount)); }
+    try { applyParsedMap(pendingImport.parsed, pendingImport.fileName, Number(expectedLedCount), preserveCsvOrigin); }
     catch (cause) { setError(cause instanceof Error ? cause.message : t('The CSV could not be imported.', 'Die CSV konnte nicht importiert werden.')); }
   };
 
@@ -1328,6 +1418,15 @@ export default function Home() {
     setActiveModuleId(additions[0].id);
     setStageMode('builder');
     setMessage(t(`${additions.length} strip module${additions.length === 1 ? '' : 's'} filled all remaining LED slots.`, `${additions.length} Streifenmodul${additions.length === 1 ? '' : 'e'} füllt alle freien LED-Slots.`));
+  };
+  const rebuildModuleSuggestions = () => {
+    const suggestions = suggestModulesFromScan(points, panels, pitch);
+    setModules(suggestions);
+    setActiveModuleId(suggestions[0]?.id ?? '');
+    setStageMode('builder');
+    setSelection([]);
+    setError('');
+    setMessage(t(`${suggestions.length} module suggestions rebuilt from scan order, row resets and zigzag turns.`, `${suggestions.length} Modulvorschläge aus Scan-Reihenfolge, Zeilenrücksprüngen und Zickzack-Wenden neu erstellt.`));
   };
   const redetectWiring = () => {
     if (!activeModule) return;
@@ -1580,6 +1679,7 @@ export default function Home() {
               <div className="coverage-bar"><i style={{ width: `${points.length ? assignedCount / points.length * 100 : 0}%` }} /></div>
               <small>{unassignedCount ? t(`${unassignedCount} LED slots still need a module.`, `${unassignedCount} LED-Slots benötigen noch ein Modul.`) : t('Every physical LED slot is assigned exactly once.', 'Jeder physische LED-Slot ist genau einmal zugewiesen.')}</small>
             </div>
+            <button className="auto-draft-button" onClick={rebuildModuleSuggestions}>◇ <span><strong>{t('Suggest modules from scan', 'Module aus Scan vorschlagen')}</strong><small>{t('Detect row returns, zigzag turns and likely matrix dimensions automatically.', 'Zeilenrücksprünge, Zickzack-Wenden und wahrscheinliche Matrixmaße automatisch erkennen.')}</small></span></button>
             <div className="free-ranges"><span>{t('Free contiguous ranges', 'Freie zusammenhängende Bereiche')}</span><div>{freeRanges.length ? freeRanges.map(range => <button key={range.first} onClick={() => { setSelection([range.first]); setStageMode('3d'); }}>{`#${range.first + 1}–${range.last + 1}`} <b>{range.last - range.first + 1}</b></button>) : <em>{t('none', 'keine')}</em>}</div></div>
             <div className="module-create">
               <div className="kind-tabs">{([
@@ -1616,11 +1716,12 @@ export default function Home() {
 
       {pendingImport && <div className="modal-backdrop" onMouseDown={() => setPendingImport(null)}><section className="modal import-modal" onMouseDown={event => event.stopPropagation()} aria-modal="true" role="dialog" aria-labelledby="import-title">
         <button className="modal-close" aria-label={t('Cancel import', 'Import abbrechen')} onClick={() => setPendingImport(null)}>×</button><span className="eyebrow">{t('MARIMAPPER CSV IMPORT', 'MARIMAPPER-CSV-IMPORT')}</span><h2 id="import-title">{t('How many LEDs should this scan contain?', 'Wie viele LEDs soll dieser Scan enthalten?')}</h2>
-        <p className="modal-lead">{t('Only gaps inside the detected CSV range are filled automatically. No LEDs before the first CSV index are created. Additional LEDs after the final index are created only when you deliberately enter a larger total below.', 'Automatisch ergänzt werden nur Lücken innerhalb des erkannten CSV-Bereichs. Vor dem ersten CSV-Index werden keine LEDs erzeugt. Zusätzliche LEDs nach dem letzten Index entstehen nur, wenn du unten bewusst eine größere Gesamtzahl eingibst.')}</p>
-        <div className="import-summary"><span>{t('CSV index range', 'CSV-Indexbereich')}<strong>{pendingImport.parsed.sourceRange ? `${pendingImport.parsed.sourceRange[0]}–${pendingImport.parsed.sourceRange[1]}` : '—'}</strong></span><span>{t('Measured LEDs', 'Gemessene LEDs')}<strong>{pendingImport.parsed.measuredCount}</strong></span><span>{t('Internal gaps', 'Interne Lücken')}<strong>{pendingImport.parsed.missingIndices.size}</strong></span></div>
-        <div className="import-options"><label className="expected-count"><span>{t('Total LEDs in this scan', 'Gesamtzahl LEDs in diesem Scan')}</span><input autoFocus type="number" min={pendingImport.parsed.coords.length} max="20000" step="1" value={expectedLedCount} onChange={event => setExpectedLedCount(event.target.value)} onKeyDown={event => event.key === 'Enter' && confirmCsvImport()} /><small>{t(`Minimum ${pendingImport.parsed.coords.length}: first through last CSV index.`, `Mindestens ${pendingImport.parsed.coords.length}: erster bis letzter CSV-Index.`)}</small></label><div className="local-pattern-note"><strong>{t('Any mixed layout', 'Beliebige gemischte Layouts')}</strong><small>{t('Local row lengths are detected independently. Square and rectangular matrices of any size — for example 5×5, 9×9, 8×32 or 32×8 — may coexist with strips and free lines.', 'Lokale Zeilenlängen werden unabhängig erkannt. Quadratische und rechteckige Matrizen beliebiger Größe – beispielsweise 5×5, 9×9, 8×32 oder 32×8 – dürfen gemeinsam mit Streifen und freien Linien vorkommen.')}</small></div></div>
+        <p className="modal-lead">{t('Internal gaps are preserved. If the file starts above index 0, you can keep that original leading index space instead of shifting every measured LED forward. After import, editable matrix and strip suggestions are generated immediately.', 'Interne Lücken bleiben erhalten. Beginnt die Datei oberhalb von Index 0, kannst du diesen ursprünglichen führenden Indexraum beibehalten, statt alle gemessenen LEDs nach vorne zu verschieben. Nach dem Import werden sofort bearbeitbare Matrix- und Streifenvorschläge erzeugt.')}</p>
+        <div className="import-summary"><span>{t('CSV index range', 'CSV-Indexbereich')}<strong>{pendingImport.parsed.sourceRange ? `${pendingImport.parsed.sourceRange[0]}–${pendingImport.parsed.sourceRange[1]}` : '—'}</strong></span><span>{t('Measured LEDs', 'Gemessene LEDs')}<strong>{pendingImport.parsed.measuredCount}</strong></span><span>{t('Missing indices', 'Fehlende Indizes')}<strong>{pendingImport.parsed.missingIndices.size ? [...pendingImport.parsed.missingIndices].slice(0, 6).map(index => `#${index + (pendingImport.parsed.sourceRange?.[0] ?? 0)}`).join(', ') : '—'}</strong></span></div>
+        {pendingImport.parsed.sourceRange && pendingImport.parsed.sourceRange[0] > 0 && <label className="leading-index-option"><input type="checkbox" checked={preserveCsvOrigin} onChange={event => { const checked = event.target.checked; setPreserveCsvOrigin(checked); setExpectedLedCount(String(pendingImport.parsed.coords.length + (checked ? pendingImport.parsed.sourceRange![0] : 0))); }} /><span><strong>{t(`Keep leading indices 0–${pendingImport.parsed.sourceRange[0] - 1}`, `Führende Indizes 0–${pendingImport.parsed.sourceRange[0] - 1} beibehalten`)}</strong><small>{t('Recommended when a matrix pattern starts with an incomplete first row. These slots are imported as missing LEDs, not as measured points.', 'Empfohlen, wenn ein Matrixmuster mit einer unvollständigen ersten Zeile beginnt. Diese Slots werden als fehlende LEDs importiert, nicht als gemessene Punkte.')}</small></span></label>}
+        <div className="import-options"><label className="expected-count"><span>{t('Total physical LED slots', 'Gesamtzahl physischer LED-Slots')}</span><input autoFocus type="number" min={pendingImport.parsed.coords.length + (preserveCsvOrigin && pendingImport.parsed.sourceRange ? pendingImport.parsed.sourceRange[0] : 0)} max="20000" step="1" value={expectedLedCount} onChange={event => setExpectedLedCount(event.target.value)} onKeyDown={event => event.key === 'Enter' && confirmCsvImport()} /><small>{t(`Current minimum: ${pendingImport.parsed.coords.length + (preserveCsvOrigin && pendingImport.parsed.sourceRange ? pendingImport.parsed.sourceRange[0] : 0)} slots.`, `Aktuelles Minimum: ${pendingImport.parsed.coords.length + (preserveCsvOrigin && pendingImport.parsed.sourceRange ? pendingImport.parsed.sourceRange[0] : 0)} Slots.`)}</small></label><div className="local-pattern-note"><strong>{t('Automatic module draft', 'Automatischer Modul-Entwurf')}</strong><small>{t('Repeated row returns and zigzag reversals become editable matrices. Remaining runs become strips. The complete MMFL preview opens directly after import.', 'Wiederholte Zeilenrücksprünge und Zickzack-Wenden werden zu bearbeitbaren Matrizen. Verbleibende Läufe werden zu Streifen. Die vollständige MMFL-Vorschau öffnet sich direkt nach dem Import.')}</small></div></div>
         <div className="import-safety">{t('The entered number is authoritative. The app will never create a pixel outside that count.', 'Die eingegebene Anzahl ist verbindlich. Die App erzeugt niemals ein Pixel außerhalb dieser Anzahl.')}</div>
-        <div className="modal-actions"><button className="secondary-button" onClick={() => setPendingImport(null)}>{t('Cancel', 'Abbrechen')}</button><button className="primary-button" onClick={confirmCsvImport}>{t('Import and position missing pixels', 'Importieren und fehlende Pixel positionieren')}</button></div>
+        <div className="modal-actions"><button className="secondary-button" onClick={() => setPendingImport(null)}>{t('Cancel', 'Abbrechen')}</button><button className="primary-button" onClick={confirmCsvImport}>{t('Import and build module preview', 'Importieren und Modulvorschau erstellen')}</button></div>
       </section></div>}
 
       {showAdjust && active && <div className="modal-backdrop" onMouseDown={() => setShowAdjust(false)}><section className="modal adjust-modal" onMouseDown={event => event.stopPropagation()} aria-modal="true" role="dialog" aria-labelledby="adjust-title">
