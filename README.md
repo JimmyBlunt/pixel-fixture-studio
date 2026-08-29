@@ -8,7 +8,7 @@
 
 ![Pixel Fixture Studio showing three detected LED panels](docs/images/01-3d-workspace.png)
 
-Pixel Fixture Studio is a local-first visual workflow for scanned, irregular LED installations. Load a Pixelblaze JSON map or a Marimapper CSV, inspect the reconstructed installation in 3D, isolate physical panels, repair suspicious measurements, align each panel in 2D, and export MadMapper-ready fixture files.
+Pixel Fixture Studio is a local-first visual workflow for scanned, irregular LED installations. Load a Pixelblaze JSON map or a Marimapper CSV, inspect the reconstructed installation in 3D, assemble the physical installation from arbitrary matrix, strip, and single-pixel modules, and export MadMapper-ready fixture files.
 
 The hosted app currently uses access-controlled Sites hosting. Everyone can run the public source locally with the instructions below.
 
@@ -16,12 +16,13 @@ The hosted app currently uses access-controlled Sites hosting. Everyone can run 
 
 - Pixelblaze JSON and Marimapper 2D/3D CSV import
 - Interactive 3D orbit, zoom, orthographic views, optional pixel numbers, click and box selection
-- Pixel editor with coordinate entry, multi-pixel keyboard nudging, search, and insertion
 - Automatic spatial panel detection with per-panel enable/disable controls
-- Large 2D alignment workspace with free rotation, axis snap, scaling, and horizontal/vertical flip
 - Automatic placement and export of missing Marimapper indices or blank coordinate rows
-- Conservative matrix- and zigzag-aware repair focused on generated pixels and clear local outliers
-- Compact, collision-free MMFL grids with a working spacing control and export-exact 2D preview
+- Modular fixture builder for matrices of any dimensions, arbitrary strips, and individual LEDs
+- Scan-assisted zigzag, row/column flow, and start-corner detection with manual overrides
+- Per-module X/Y placement, physical width/height, rotation, and an export-exact MMFL preview
+- Strict coverage rules: each imported LED slot is assigned once, and only modules that fit a remaining contiguous range can be added
+- Reserved hidden LEDs remain part of the wiring order and DMX address spacing without rendering a visible MMFL cell
 - MadMapper 6.1 SVG, CSV, and experimental MMFL exports
 - English default interface with instant German translation
 - Local-first processing: map files never leave the browser
@@ -32,23 +33,21 @@ The hosted app currently uses access-controlled Sites hosting. Everyone can run 
 
 Open the [hosted app](https://pixel-fixture-studio.jimmyblunt44.chatgpt.site/) (workspace access may be required) or run it locally, then load a mapping file. The included demo shows three separated panels, so every tool can be explored without supplying data.
 
-### 2. Select and align
+### 2. Allocate physical modules
 
-Choose a detected panel or draw a box around LEDs to create a custom panel. Click a pixel to inspect and edit its X/Y/Z values, search by its one-based pixel number, or enable Edit Mode to move a selection with the arrow keys. `Page Up`/`Page Down` move Z and `Shift` uses a 10× step. New pixels are inserted on the active panel's best-fit plane; following source numbers shift forward.
+Open the Module Builder and choose a matrix, strip, or single pixel. Matrix dimensions are unrestricted within the number of remaining contiguous LED slots: 3×4, 9×9, 8×32, 12×3, and mixed layouts are all valid. The builder shows every free source-index range and prevents assignments that overlap an existing module or exceed the confirmed scan length.
 
-Swap the large workspace to 2D to rotate, snap, scale, or flip the fixture before export. Enable the MMFL grid to see the exact quantised cells, including empty cells, that the MMFL export will contain. Collision handling first preserves every LED, then removes globally empty rows and columns. The size control is applied to that compact integer grid, so it remains visible and effective in the preview and export.
+Start a module at the next free slot or at the first LED selected in the 3D scan. Wiring direction, row/column order, serpentine routing, and the start corner are estimated from the assigned scan range and remain manually editable.
 
 ![Large MadMapper-style 2D alignment view](docs/images/02-2d-alignment.png)
 
-### 3. Review repairs
+### 3. Arrange the output grid
 
-For every Marimapper CSV, an import dialog shows the detected source-index range, measured count, and internal gaps, then asks for the authoritative total LED count. The default contains only the span from the first to last CSV index: no leading LEDs are invented, and trailing LEDs are added only when the entered total explicitly requires them.
+Drag complete modules in the large 2D builder, then enter exact X/Y positions, physical width and height, and rotation. The preview and MMFL exporter share the same rounded grid, so collisions are visible before export and block an invalid MMFL download.
 
-Missing indices and rows with empty coordinates inside that bounded scan are positioned automatically. Repeated row turns are evaluated near each missing pixel instead of imposing one matrix width on the whole scan. Row length and row count are independent, so one file can contain arbitrary square and rectangular layouts such as 5×5, 9×9, 8×32, and 32×8 alongside straight strips and free lines. Missing cells are extrapolated from matching columns in neighbouring serpentine rows and checked against the nearest intact pixel in the target row. Automatically inferred pixels are marked in turquoise, included in the active panel and export, and never used to detect the row structure themselves.
+Pixels that exist physically but must never light can be marked hidden on their module. A hidden pixel stays visible as a crossed placeholder in the editor and continues to consume its source index and channel offset. The MMFL cell is written as `0`; every later mapped cell is still calculated from its original source index. This is the compatibility approach used because MMFL does not publicly document a dedicated hidden-pixel flag.
 
-Auto Repair reviews inferred and manually inserted pixels first while protecting measured coordinates by default. Scanned outlier review must be enabled explicitly. A measured point is proposed only when a clean line fitted from four intact local neighbours and the wider neighbourhood both identify a clear deviation. Normal scan noise, bends, and row turns are rejected. No repair is preselected; every change requires individual confirmation.
-
-![Auto Repair review with sensitivity and zoom controls](docs/images/03-auto-repair.png)
+For every Marimapper CSV, the import dialog still shows the detected source-index range, measured count, and internal gaps, then asks for the authoritative total LED count. No leading LEDs are invented, and trailing LEDs are added only when the entered total explicitly requires them.
 
 ### 4. Export
 
@@ -91,7 +90,7 @@ Sparse Marimapper indices and indexed rows with blank/non-finite coordinates are
 | --- | --- | --- |
 | SVG 6.1 | Freeform fixture placement | Preserves precise 2D positions, panel groups, and DMX attributes. |
 | CSV | Fixture instance tables | Semicolon-delimited rows with definition, patch, bounds, and group path. |
-| MMFL | Fixture Editor experiments | Quantises each panel onto a 2D grid. The imported product name comes from **Fixture Definition**; multi-panel exports append the panel name. |
+| MMFL | Modular fixture grid | Combines all assigned modules into one exact grid. Hidden LEDs become empty cells while preserving the source/DMX offset. The imported product name comes from **Fixture Definition**. |
 
 MadMapper fixtures are 2D. Each selected 3D panel is projected onto its own best-fit plane; the source map and LED order remain unchanged.
 

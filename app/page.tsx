@@ -7,6 +7,28 @@ type Language = 'en' | 'de';
 type MapPoint = { sourceIndex: number; xyz: Vec3; status: 'ok' | 'inferred' | 'manual' | 'placeholder' | 'outlier' };
 type PanelTransform = { rotation: number; scale: number; flipX: boolean; flipY: boolean };
 type Panel = { id: string; name: string; indices: number[]; color: string; enabled: boolean; transform: PanelTransform };
+type PixelModuleKind = 'matrix' | 'strip' | 'single';
+type ModuleOrder = 'rows' | 'columns';
+type ModuleCorner = 'tl' | 'tr' | 'bl' | 'br';
+type PixelModule = {
+  id: string;
+  name: string;
+  kind: PixelModuleKind;
+  startIndex: number;
+  rows: number;
+  columns: number;
+  order: ModuleOrder;
+  zigzag: boolean;
+  startCorner: ModuleCorner;
+  wiringDetected: boolean;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  rotation: number;
+  hiddenIndices: number[];
+  color: string;
+};
 type Camera = { yaw: number; pitch: number; zoom: number };
 type Projection = { sourceIndex: number; u: number; v: number };
 type PanelBasis = { center: Vec3; e1: Vec3; e2: Vec3 };
@@ -30,6 +52,7 @@ type MatrixModel = {
 };
 type SerpentineLayout = { rowLength: number; rowStartPhase: number };
 type LocalLineEstimate = { position: Vec3; deviationRatio: number; lineNoiseRatio: number; supportCount: number };
+type ModuleCell = { moduleId: string; sourceIndex: number; x: number; y: number; hidden: boolean; value: number };
 
 const COLORS = ['#ff4f87', '#8c7cff', '#37d9c5', '#ffae4f', '#4fa8ff', '#d875ff'];
 
@@ -217,6 +240,152 @@ function mode(values: number[]) {
 
 function modulo(value: number, divisor: number) {
   return ((value % divisor) + divisor) % divisor;
+}
+
+function modulePixelCount(module: PixelModule) {
+  return Math.max(1, module.rows) * Math.max(1, module.columns);
+}
+
+function moduleIndices(module: PixelModule) {
+  return Array.from({ length: modulePixelCount(module) }, (_, offset) => module.startIndex + offset);
+}
+
+function unassignedRanges(modules: PixelModule[], total: number) {
+  const assigned = new Set(modules.flatMap(moduleIndices).filter(index => index >= 0 && index < total));
+  const ranges: { first: number; last: number }[] = [];
+  let first = -1;
+  for (let index = 0; index <= total; index++) {
+    if (index < total && !assigned.has(index)) {
+      if (first < 0) first = index;
+    } else if (first >= 0) {
+      ranges.push({ first, last: index - 1 });
+      first = -1;
+    }
+  }
+  return ranges;
+}
+
+function firstFreeRange(modules: PixelModule[], total: number, count: number) {
+  const assigned = new Set(modules.flatMap(moduleIndices));
+  for (let first = 0; first + count <= total; first++) {
+    if (Array.from({ length: count }, (_, offset) => first + offset).every(index => !assigned.has(index))) return first;
+  }
+  return -1;
+}
+
+function moduleLocalCell(module: PixelModule, offset: number) {
+  const rows = Math.max(1, module.rows), columns = Math.max(1, module.columns);
+  let row = 0, column = 0;
+  if (module.order === 'rows') {
+    row = Math.floor(offset / columns);
+    const step = offset % columns;
+    column = module.zigzag && row % 2 ? columns - 1 - step : step;
+  } else {
+    column = Math.floor(offset / rows);
+    const step = offset % rows;
+    row = module.zigzag && column % 2 ? rows - 1 - step : step;
+  }
+  if (module.startCorner.includes('r')) column = columns - 1 - column;
+  if (module.startCorner.includes('b')) row = rows - 1 - row;
+  return { row, column };
+}
+
+function moduleCells(module: PixelModule, channels: number): ModuleCell[] {
+  const count = modulePixelCount(module), hidden = new Set(module.hiddenIndices);
+  const radians = module.rotation * Math.PI / 180, c = Math.cos(radians), s = Math.sin(radians);
+  return Array.from({ length: count }, (_, offset) => {
+    const { row, column } = moduleLocalCell(module, offset);
+    const localX = module.columns <= 1 ? module.width / 2 : column / (module.columns - 1) * module.width;
+    const localY = module.rows <= 1 ? module.height / 2 : row / (module.rows - 1) * module.height;
+    const dx = localX - module.width / 2, dy = localY - module.height / 2;
+    const sourceIndex = module.startIndex + offset;
+    return {
+      moduleId: module.id,
+      sourceIndex,
+      x: module.x + module.width / 2 + dx * c - dy * s,
+      y: module.y + module.height / 2 + dx * s + dy * c,
+      hidden: hidden.has(sourceIndex),
+      value: 1 + sourceIndex * channels,
+    };
+  });
+}
+
+function moduleGrid(modules: PixelModule[], channels: number) {
+  const raw = modules.flatMap(module => moduleCells(module, channels));
+  if (!raw.length) return { cells: [] as (ModuleCell & { gridX: number; gridY: number })[], width: 1, height: 1, collisions: [] as string[] };
+  const rounded = raw.map(cell => ({ ...cell, gridX: Math.round(cell.x), gridY: Math.round(cell.y) }));
+  const minX = Math.min(...rounded.map(cell => cell.gridX)), minY = Math.min(...rounded.map(cell => cell.gridY));
+  const cells = rounded.map(cell => ({ ...cell, gridX: cell.gridX - minX, gridY: cell.gridY - minY }));
+  const occupied = new Map<string, ModuleCell & { gridX: number; gridY: number }>();
+  const collisions: string[] = [];
+  cells.forEach(cell => {
+    const key = `${cell.gridX}:${cell.gridY}`, previous = occupied.get(key);
+    if (previous) collisions.push(`#${previous.sourceIndex + 1} / #${cell.sourceIndex + 1}`);
+    else occupied.set(key, cell);
+  });
+  return {
+    cells,
+    width: Math.max(...cells.map(cell => cell.gridX)) + 1,
+    height: Math.max(...cells.map(cell => cell.gridY)) + 1,
+    collisions,
+  };
+}
+
+function makeModule(name: string, kind: PixelModuleKind, startIndex: number, rows: number, columns: number, position: number): PixelModule {
+  const safeRows = kind === 'matrix' ? Math.max(1, rows) : 1;
+  const safeColumns = kind === 'matrix' ? Math.max(1, columns) : kind === 'strip' ? Math.max(1, columns) : 1;
+  return {
+    id: `module-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    name,
+    kind,
+    startIndex,
+    rows: safeRows,
+    columns: safeColumns,
+    order: 'rows',
+    zigzag: kind === 'matrix',
+    startCorner: 'tl',
+    wiringDetected: false,
+    x: position * (safeColumns + 3),
+    y: 0,
+    width: Math.max(safeColumns - 1, 0),
+    height: Math.max(safeRows - 1, 0),
+    rotation: 0,
+    hiddenIndices: [],
+    color: COLORS[position % COLORS.length],
+  };
+}
+
+function detectModuleWiring(module: PixelModule, points: MapPoint[], panels: Panel[], pitch: number): PixelModule {
+  const indices = moduleIndices(module).filter(index => points[index]);
+  if (indices.length < 2) return { ...module, wiringDetected: false };
+  const owner = panels.find(panel => indices.some(index => panel.indices.includes(index)));
+  const panel = owner ?? { id: 'detect', name: 'Detect', indices, color: module.color, enabled: true, transform: { rotation: 0, scale: 1, flipX: false, flipY: false } };
+  const layout = detectSerpentineLayout(panel, points, pitch, module.startIndex);
+  const projected = projectPanel({ ...panel, indices }, points);
+  const first = projected.find(point => point.sourceIndex === module.startIndex) ?? projected[0];
+  const middleU = median(projected.map(point => point.u)), middleV = median(projected.map(point => point.v));
+  const horizontal = !first || first.u <= middleU ? 'l' : 'r';
+  const vertical = !first || first.v <= middleV ? 't' : 'b';
+  const rowMatch = layout?.rowLength === module.columns;
+  const columnMatch = layout?.rowLength === module.rows;
+  return {
+    ...module,
+    order: columnMatch && !rowMatch ? 'columns' : 'rows',
+    zigzag: Boolean(layout),
+    startCorner: `${vertical}${horizontal}` as ModuleCorner,
+    wiringDetected: Boolean(layout || first),
+  };
+}
+
+function buildModuleMmfl(modules: PixelModule[], total: number, settings: ExportSettings) {
+  const ranges = unassignedRanges(modules, total);
+  if (ranges.length) throw new Error(`Assign all LED slots before MMFL export. ${ranges.reduce((sum, range) => sum + range.last - range.first + 1, 0)} remain unassigned.`);
+  const grid = moduleGrid(modules, settings.channels);
+  if (grid.collisions.length) throw new Error(`Move or resize modules before export: ${grid.collisions.length} grid collisions remain.`);
+  if (grid.width * grid.height > 2000000) throw new Error('The module grid is too large for a practical MMFL fixture.');
+  const values = Array.from({ length: grid.width * grid.height }, () => 0);
+  grid.cells.forEach(cell => { if (!cell.hidden) values[cell.gridY * grid.width + cell.gridX] = cell.value; });
+  return `<?xml version="1.0" encoding="UTF-8"?>\n<LEDFixtureLibrary>\n  <LEDFixture favorite="1" group="Pixel Fixture Studio" product="${xmlEscape(settings.definition)}">\n    <PixelMapping avoidCrossUniversePixels="1" type="${settings.channels === 4 ? 'RGBW' : 'RGB'}" height="${grid.height}" width="${grid.width}">${values.join(' ')}</PixelMapping>\n  </LEDFixture>\n</LEDFixtureLibrary>\n`;
 }
 
 /** Find the indexed spatial run around one pixel, separating distant matrices and strips. */
@@ -665,7 +834,7 @@ function download(name: string, content: string, type: string) {
   setTimeout(() => URL.revokeObjectURL(link.href), 1000);
 }
 
-function MapCanvas({ points, panels, selectionMode, showPixelNumbers, selectedIndices, onSelection, camera, onCameraChange, language }: { points: MapPoint[]; panels: Panel[]; selectionMode: boolean; showPixelNumbers: boolean; selectedIndices: number[]; onSelection: (indices: number[], additive?: boolean) => void; camera: Camera; onCameraChange: (camera: Camera) => void; language: Language }) {
+function MapCanvas({ points, panels, selectionMode, showPixelNumbers, hiddenIndices = [], selectedIndices, onSelection, camera, onCameraChange, language }: { points: MapPoint[]; panels: Panel[]; selectionMode: boolean; showPixelNumbers: boolean; hiddenIndices?: number[]; selectedIndices: number[]; onSelection: (indices: number[], additive?: boolean) => void; camera: Camera; onCameraChange: (camera: Camera) => void; language: Language }) {
   const ref = useRef<HTMLCanvasElement>(null);
   const drag = useRef<{ x: number; y: number; yaw: number; pitch: number; selecting: boolean; additive: boolean; moved: boolean } | null>(null);
   const [box, setBox] = useState<{ x1: number; y1: number; x2: number; y2: number } | null>(null);
@@ -681,6 +850,7 @@ function MapCanvas({ points, panels, selectionMode, showPixelNumbers, selectedIn
       ctx.clearRect(0, 0, rect.width, rect.height);
       const visible = panels.filter(p => p.enabled).flatMap(panel => panel.indices.map(index => ({ index, color: panel.color }))).filter(item => points[item.index]);
       const selected = new Set(selectedIndices);
+      const hidden = new Set(hiddenIndices);
       const center: Vec3 = [0, 0, 0]; visible.forEach(item => points[item.index].xyz.forEach((n, i) => center[i] += n / Math.max(visible.length, 1)));
       const rotated = visible.map(item => {
         const p = points[item.index].xyz, x = p[0] - center[0], y = p[1] - center[1], z = p[2] - center[2];
@@ -695,9 +865,10 @@ function MapCanvas({ points, panels, selectionMode, showPixelNumbers, selectedIn
       rotated.sort((a, b) => a.z - b.z);
       projectedRef.current = rotated.map(p => ({ index: p.index, x: rect.width / 2 + p.x * scale, y: rect.height / 2 - p.y * scale }));
       rotated.forEach((p, i) => {
-        const screen = projectedRef.current[i], isSelected = selected.has(p.index);
-        ctx.shadowColor = p.color; ctx.shadowBlur = isSelected ? 15 : 8; ctx.fillStyle = isSelected ? '#ffffff' : p.color; ctx.globalAlpha = .66 + i / Math.max(rotated.length, 1) * .34;
+        const screen = projectedRef.current[i], isSelected = selected.has(p.index), isHidden = hidden.has(p.index);
+        ctx.shadowColor = p.color; ctx.shadowBlur = isHidden ? 0 : isSelected ? 15 : 8; ctx.fillStyle = isHidden ? '#475064' : isSelected ? '#ffffff' : p.color; ctx.globalAlpha = isHidden ? .34 : .66 + i / Math.max(rotated.length, 1) * .34;
         ctx.beginPath(); ctx.arc(screen.x, screen.y, Math.max(2, Math.min(isSelected ? 6.5 : 4.2, (isSelected ? 3.8 : 2.3) * camera.zoom)), 0, Math.PI * 2); ctx.fill();
+        if (isHidden) { ctx.strokeStyle = '#8c96a9'; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(screen.x - 4, screen.y - 4); ctx.lineTo(screen.x + 4, screen.y + 4); ctx.moveTo(screen.x + 4, screen.y - 4); ctx.lineTo(screen.x - 4, screen.y + 4); ctx.stroke(); }
         if (isSelected) { ctx.globalAlpha = 1; ctx.strokeStyle = '#ff4f87'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(screen.x, screen.y, Math.max(7, 5 * camera.zoom), 0, Math.PI * 2); ctx.stroke(); }
         if (showPixelNumbers) { ctx.globalAlpha = .95; ctx.shadowBlur = 3; ctx.font = `${Math.max(9, Math.min(13, 9 * camera.zoom))}px ui-monospace, monospace`; ctx.fillStyle = '#eef3ff'; ctx.fillText(String(p.index + 1), screen.x + 6, screen.y - 6); }
       });
@@ -709,7 +880,7 @@ function MapCanvas({ points, panels, selectionMode, showPixelNumbers, selectedIn
       if (box) { ctx.fillStyle = 'rgba(255,79,135,.12)'; ctx.strokeStyle = '#ff4f87'; ctx.setLineDash([5, 4]); ctx.fillRect(box.x1, box.y1, box.x2 - box.x1, box.y2 - box.y1); ctx.strokeRect(box.x1, box.y1, box.x2 - box.x1, box.y2 - box.y1); ctx.setLineDash([]); }
     };
     render(); const observer = new ResizeObserver(render); observer.observe(canvas); return () => observer.disconnect();
-  }, [points, panels, box, revision, camera, selectedIndices, showPixelNumbers]);
+  }, [points, panels, box, revision, camera, selectedIndices, showPixelNumbers, hiddenIndices]);
 
   const pointerDown = (event: ReactPointerEvent<HTMLCanvasElement>) => {
     event.currentTarget.setPointerCapture(event.pointerId);
@@ -824,6 +995,82 @@ function FixturePreview({ panel, points, ledSize, interactive = false, showOutpu
   return <canvas ref={ref} className={`fixture-canvas ${interactive ? 'interactive' : ''}`} onPointerDown={pointerDown} onPointerMove={pointerMove} onPointerUp={pointerUp} onPointerCancel={pointerUp} onWheel={wheel} aria-label={interactive ? translated(language, 'Interactive 2D alignment: drag to rotate, use the wheel to scale', 'Interaktive 2D-Ausrichtung: ziehen dreht, Mausrad skaliert') : translated(language, '2D projection as shown in MadMapper', '2D-Projektion wie in MadMapper')} />;
 }
 
+function ModulePreview({ modules, activeId, channels, showNumbers, onSelect, onChange, language }: { modules: PixelModule[]; activeId: string; channels: number; showNumbers: boolean; onSelect: (id: string) => void; onChange: (module: PixelModule) => void; language: Language }) {
+  const ref = useRef<HTMLCanvasElement>(null);
+  const drag = useRef<{ id: string; clientX: number; clientY: number; x: number; y: number } | null>(null);
+  const hitAreas = useRef<{ id: string; x: number; y: number; radius: number }[]>([]);
+  const pixelsPerCell = useRef(12);
+
+  useEffect(() => {
+    const canvas = ref.current; if (!canvas) return;
+    const ctx = canvas.getContext('2d'); if (!ctx) return;
+    const render = () => {
+      const rect = canvas.getBoundingClientRect(), ratio = window.devicePixelRatio || 1;
+      canvas.width = rect.width * ratio; canvas.height = rect.height * ratio;
+      ctx.setTransform(ratio, 0, 0, ratio, 0, 0); ctx.clearRect(0, 0, rect.width, rect.height);
+      const grid = moduleGrid(modules, channels);
+      const scale = Math.max(5, Math.min(24, Math.min((rect.width - 60) / Math.max(grid.width, 1), (rect.height - 60) / Math.max(grid.height, 1))));
+      pixelsPerCell.current = scale;
+      const originX = rect.width / 2 - (grid.width - 1) * scale / 2;
+      const originY = rect.height / 2 - (grid.height - 1) * scale / 2;
+      const collisionKeys = new Set<string>();
+      const seen = new Set<string>();
+      grid.cells.forEach(cell => { const key = `${cell.gridX}:${cell.gridY}`; if (seen.has(key)) collisionKeys.add(key); seen.add(key); });
+
+      ctx.lineWidth = 1;
+      for (let row = 0; row < grid.height; row++) for (let column = 0; column < grid.width; column++) {
+        const x = originX + column * scale, y = originY + row * scale;
+        ctx.strokeStyle = 'rgba(140,151,178,.14)';
+        ctx.strokeRect(x - scale * .43, y - scale * .43, scale * .86, scale * .86);
+      }
+
+      hitAreas.current = [];
+      grid.cells.forEach(cell => {
+        const module = modules.find(item => item.id === cell.moduleId); if (!module) return;
+        const x = originX + cell.gridX * scale, y = originY + cell.gridY * scale;
+        const active = module.id === activeId, collision = collisionKeys.has(`${cell.gridX}:${cell.gridY}`);
+        hitAreas.current.push({ id: module.id, x, y, radius: Math.max(scale * .65, 9) });
+        ctx.globalAlpha = cell.hidden ? .42 : 1;
+        ctx.fillStyle = collision ? '#ff704d' : cell.hidden ? '#202838' : module.color;
+        ctx.strokeStyle = active ? '#ffffff' : collision ? '#ffb454' : module.color;
+        ctx.lineWidth = active ? 2 : 1;
+        ctx.beginPath(); ctx.roundRect(x - scale * .34, y - scale * .34, scale * .68, scale * .68, Math.max(1, scale * .12)); ctx.fill(); ctx.stroke();
+        if (cell.hidden) {
+          ctx.strokeStyle = '#8c96a9'; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(x - scale * .2, y - scale * .2); ctx.lineTo(x + scale * .2, y + scale * .2); ctx.moveTo(x + scale * .2, y - scale * .2); ctx.lineTo(x - scale * .2, y + scale * .2); ctx.stroke();
+        }
+        if (showNumbers && scale >= 10) {
+          ctx.globalAlpha = 1; ctx.fillStyle = '#f4f7fb'; ctx.font = `${Math.max(7, Math.min(11, scale * .45))}px ui-monospace, monospace`; ctx.fillText(String(cell.sourceIndex + 1), x + scale * .38, y - scale * .38);
+        }
+      });
+      ctx.globalAlpha = 1;
+      if (!modules.length) {
+        ctx.fillStyle = '#7e899e'; ctx.font = '13px system-ui'; ctx.textAlign = 'center';
+        ctx.fillText(translated(language, 'Add a matrix or strip to begin.', 'Füge zuerst eine Matrix oder einen Streifen hinzu.'), rect.width / 2, rect.height / 2);
+        ctx.textAlign = 'start';
+      }
+    };
+    render(); const observer = new ResizeObserver(render); observer.observe(canvas); return () => observer.disconnect();
+  }, [modules, activeId, channels, showNumbers, language]);
+
+  const pointerDown = (event: ReactPointerEvent<HTMLCanvasElement>) => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    const x = event.clientX - rect.left, y = event.clientY - rect.top;
+    const hit = [...hitAreas.current].sort((a, b) => Math.hypot(a.x - x, a.y - y) - Math.hypot(b.x - x, b.y - y)).find(area => Math.hypot(area.x - x, area.y - y) <= area.radius);
+    if (!hit) return;
+    const module = modules.find(item => item.id === hit.id); if (!module) return;
+    event.currentTarget.setPointerCapture(event.pointerId); onSelect(module.id);
+    drag.current = { id: module.id, clientX: event.clientX, clientY: event.clientY, x: module.x, y: module.y };
+  };
+  const pointerMove = (event: ReactPointerEvent<HTMLCanvasElement>) => {
+    if (!drag.current) return;
+    const module = modules.find(item => item.id === drag.current!.id); if (!module) return;
+    const scale = Math.max(pixelsPerCell.current, 1);
+    onChange({ ...module, x: Math.round((drag.current.x + (event.clientX - drag.current.clientX) / scale) * 10) / 10, y: Math.round((drag.current.y + (event.clientY - drag.current.clientY) / scale) * 10) / 10 });
+  };
+  const pointerUp = () => { drag.current = null; };
+  return <canvas ref={ref} className="module-canvas interactive" onPointerDown={pointerDown} onPointerMove={pointerMove} onPointerUp={pointerUp} onPointerCancel={pointerUp} aria-label={translated(language, 'Interactive modular MMFL layout; drag a module to move it', 'Interaktiver modularer MMFL-Aufbau; Modul zum Verschieben ziehen')} />;
+}
+
 function RepairPreview({ panel, points, suggestions, zoom, onZoomChange, language }: { panel?: Panel; points: MapPoint[]; suggestions: RepairSuggestion[]; zoom: number; onZoomChange: (zoom: number) => void; language: Language }) {
   const ref = useRef<HTMLCanvasElement>(null);
   const [pan, setPan] = useState({ x: 0, y: 0 });
@@ -865,15 +1112,27 @@ function RepairPreview({ panel, points, suggestions, zoom, onZoomChange, languag
 
 export default function Home() {
   const initial = useMemo(() => analyze(makeDemo()), []);
+  const initialModules = useMemo(() => initial.panels.map((panel, index) => ({
+    ...makeModule(`Demo Matrix ${index + 1}`, 'matrix', panel.indices[0], 8, 12, index),
+    x: index * 15,
+  })), [initial]);
   const [language, setLanguage] = useState<Language>('en');
   const [points, setPoints] = useState(initial.points);
   const [panels, setPanels] = useState(initial.panels);
+  const [modules, setModules] = useState<PixelModule[]>(initialModules);
+  const [activeModuleId, setActiveModuleId] = useState(initialModules[0]?.id ?? '');
+  const [moduleKind, setModuleKind] = useState<PixelModuleKind>('matrix');
+  const [moduleRows, setModuleRows] = useState(8);
+  const [moduleColumns, setModuleColumns] = useState(8);
+  const [moduleLength, setModuleLength] = useState(30);
+  const [hiddenPixelInput, setHiddenPixelInput] = useState('');
+  const [showModuleNumbers, setShowModuleNumbers] = useState(true);
   const [fileName, setFileName] = useState('Demo · 3 Panels');
   const [pitch, setPitch] = useState(initial.pitch);
   const [activeId, setActiveId] = useState(initial.panels[0]?.id ?? '');
   const [view, setView] = useState('3D');
   const [mapCamera, setMapCamera] = useState<Camera>({ yaw: -.5, pitch: -.28, zoom: 1 });
-  const [stageMode, setStageMode] = useState<'3d' | '2d'>('3d');
+  const [stageMode, setStageMode] = useState<'3d' | 'builder'>('3d');
   const [selectionMode, setSelectionMode] = useState(false);
   const [selection, setSelection] = useState<number[]>([]);
   const [showPixelNumbers, setShowPixelNumbers] = useState(false);
@@ -900,7 +1159,22 @@ export default function Home() {
   const t = (english: string, german: string) => translated(language, english, german);
   const numberFormat = useMemo(() => new Intl.NumberFormat(language === 'en' ? 'en-US' : 'de-DE'), [language]);
   const active = panels.find(panel => panel.id === activeId) ?? panels[0];
+  const activeModule = modules.find(module => module.id === activeModuleId) ?? modules[0];
   const enabledPanels = panels.filter(panel => panel.enabled);
+  const freeRanges = useMemo(() => unassignedRanges(modules, points.length), [modules, points.length]);
+  const unassignedCount = freeRanges.reduce((sum, range) => sum + range.last - range.first + 1, 0);
+  const modularGrid = useMemo(() => moduleGrid(modules, settings.channels), [modules, settings.channels]);
+  const hiddenIndices = useMemo(() => modules.flatMap(module => module.hiddenIndices), [modules]);
+  const largestFreeRun = freeRanges.reduce((largest, range) => Math.max(largest, range.last - range.first + 1), 0);
+  const draftModuleCount = moduleKind === 'matrix' ? Math.max(1, moduleRows) * Math.max(1, moduleColumns) : moduleKind === 'strip' ? Math.max(1, moduleLength) : 1;
+  const selectionStart = selection.length ? Math.min(...selection) : -1;
+  const selectionFreeCapacity = selectionStart < 0 ? 0 : (() => {
+    const range = freeRanges.find(item => selectionStart >= item.first && selectionStart <= item.last);
+    return range ? range.last - selectionStart + 1 : 0;
+  })();
+  const assignedCount = points.length - unassignedCount;
+  const draftFitsNext = draftModuleCount <= largestFreeRun;
+  const draftFitsSelection = selectionStart >= 0 && draftModuleCount <= selectionFreeCapacity;
   const placeholders = points.filter(point => point.status === 'placeholder').length;
   const inferred = points.filter(point => point.status === 'inferred').length;
   const outliers = points.filter(point => point.status === 'outlier').length;
@@ -948,6 +1222,8 @@ export default function Home() {
     const recovered = missingIndices.size ? placeMissingCoordinates(analyzed.points, analyzed.panels, analyzed.pitch, missingIndices) : { points: analyzed.points, panels: analyzed.panels, placed: 0, unresolved: 0 };
     setPoints(recovered.points);
     setPanels(recovered.panels);
+    setModules([]);
+    setActiveModuleId('');
     setActiveId(recovered.panels[0].id);
     setPitch(analyzed.pitch);
     setFileName(importedFileName);
@@ -997,6 +1273,80 @@ export default function Home() {
   };
 
   const togglePanel = (id: string) => setPanels(items => items.map(item => item.id === id ? { ...item, enabled: !item.enabled } : item));
+  const updateModule = (next: PixelModule) => {
+    setModules(items => items.map(item => item.id === next.id ? {
+      ...next,
+      startIndex: Math.max(0, Math.min(points.length - modulePixelCount(next), Math.trunc(next.startIndex))),
+      rows: Math.max(1, Math.trunc(next.rows)),
+      columns: Math.max(1, Math.trunc(next.columns)),
+      width: Math.max(0, next.width),
+      height: Math.max(0, next.height),
+      rotation: normalizeDegrees(next.rotation),
+    } : item));
+  };
+  const addModule = (fromSelection = false) => {
+    const rows = moduleKind === 'matrix' ? Math.max(1, Math.trunc(moduleRows)) : 1;
+    const columns = moduleKind === 'matrix' ? Math.max(1, Math.trunc(moduleColumns)) : moduleKind === 'strip' ? Math.max(1, Math.trunc(moduleLength)) : 1;
+    const count = rows * columns;
+    const startIndex = fromSelection && selection.length ? Math.min(...selection) : firstFreeRange(modules, points.length, count);
+    if (startIndex < 0 || startIndex + count > points.length) {
+      setError(t(`No free run of ${count} LED slots is available.`, `Es ist kein freier Bereich mit ${count} LED-Slots verfügbar.`));
+      return;
+    }
+    const occupied = new Set(modules.flatMap(moduleIndices));
+    if (Array.from({ length: count }, (_, offset) => startIndex + offset).some(index => occupied.has(index))) {
+      setError(t('The selected index range is already assigned to another module.', 'Der ausgewählte Indexbereich gehört bereits zu einem anderen Modul.'));
+      return;
+    }
+    const label = moduleKind === 'matrix' ? `${rows}×${columns} Matrix` : moduleKind === 'strip' ? `${columns} LED Strip` : t('Single LED', 'Einzelpixel');
+    let module = makeModule(`${label} ${modules.length + 1}`, moduleKind, startIndex, rows, columns, modules.length);
+    const existingCells = modules.flatMap(item => moduleCells(item, settings.channels));
+    module = { ...module, x: existingCells.length ? Math.max(...existingCells.map(cell => cell.x)) + 4 : 0, y: existingCells.length ? Math.min(...existingCells.map(cell => cell.y)) : 0 };
+    module = detectModuleWiring(module, points, panels, pitch);
+    setModules(items => [...items, module]);
+    setActiveModuleId(module.id);
+    setStageMode('builder');
+    setSelection([]);
+    setError('');
+    setMessage(t(`${module.name} assigned to pixels ${startIndex + 1}–${startIndex + count}.`, `${module.name} den Pixeln ${startIndex + 1}–${startIndex + count} zugeordnet.`));
+  };
+  const removeModule = (id: string) => {
+    setModules(items => items.filter(item => item.id !== id));
+    if (activeModuleId === id) setActiveModuleId(modules.find(item => item.id !== id)?.id ?? '');
+    setMessage(t('Module removed; its LED slots are free again.', 'Modul entfernt; seine LED-Slots sind wieder frei.'));
+  };
+  const fillFreeAsStrips = () => {
+    if (!freeRanges.length) return;
+    const existingCells = modules.flatMap(item => moduleCells(item, settings.channels));
+    const firstY = existingCells.length ? Math.max(...existingCells.map(cell => cell.y)) + 3 : 0;
+    const additions = freeRanges.map((range, index) => ({
+      ...makeModule(`${t('Remaining strip', 'Reststreifen')} ${modules.length + index + 1}`, 'strip', range.first, 1, range.last - range.first + 1, modules.length + index),
+      x: 0,
+      y: firstY + index * 3,
+    }));
+    setModules(items => [...items, ...additions]);
+    setActiveModuleId(additions[0].id);
+    setStageMode('builder');
+    setMessage(t(`${additions.length} strip module${additions.length === 1 ? '' : 's'} filled all remaining LED slots.`, `${additions.length} Streifenmodul${additions.length === 1 ? '' : 'e'} füllt alle freien LED-Slots.`));
+  };
+  const redetectWiring = () => {
+    if (!activeModule) return;
+    const detected = detectModuleWiring(activeModule, points, panels, pitch);
+    updateModule(detected);
+    setMessage(detected.wiringDetected ? t('Wiring direction detected from the assigned scan range.', 'Verdrahtungsrichtung aus dem zugeordneten Scanbereich erkannt.') : t('No stable wiring pattern detected; manual settings remain available.', 'Kein stabiles Verdrahtungsmuster erkannt; die manuellen Einstellungen bleiben verfügbar.'));
+  };
+  const toggleHiddenPixel = (sourceIndex: number) => {
+    if (!activeModule || !moduleIndices(activeModule).includes(sourceIndex)) {
+      setError(t('Choose a pixel number inside the active module.', 'Wähle eine Pixelnummer innerhalb des aktiven Moduls.'));
+      return;
+    }
+    const hidden = new Set(activeModule.hiddenIndices);
+    if (hidden.has(sourceIndex)) hidden.delete(sourceIndex); else hidden.add(sourceIndex);
+    updateModule({ ...activeModule, hiddenIndices: [...hidden].sort((a, b) => a - b) });
+    setHiddenPixelInput('');
+    setError('');
+    setMessage(t(`Pixel ${sourceIndex + 1} ${hidden.has(sourceIndex) ? 'is now reserved but hidden' : 'is visible again'}.`, `Pixel ${sourceIndex + 1} ${hidden.has(sourceIndex) ? 'ist nun reserviert, aber ausgeblendet' : 'ist wieder sichtbar'}.`));
+  };
   const selectPixels = (indices: number[], additive = false) => {
     const valid = indices.filter(index => points[index]);
     setSelection(current => {
@@ -1126,16 +1476,27 @@ export default function Home() {
     setMessage(t(`${accepted.length} confirmed pixel position${accepted.length === 1 ? '' : 's'} repaired.`, `${accepted.length} bestätigte Pixelposition${accepted.length === 1 ? '' : 'en'} repariert.`));
   };
   const exportFile = (format: 'svg' | 'csv' | 'mmfl') => {
-    if (!enabledPanels.length) {
+    if (format !== 'mmfl' && !enabledPanels.length) {
       setError(t('Enable at least one panel for export.', 'Aktiviere mindestens ein Panel für den Export.'));
       return;
     }
-    // The Fixture Definition is the user's canonical export name.
-    const base = safeName(settings.definition);
-    const mime = format === 'svg' ? 'image/svg+xml' : format === 'csv' ? 'text/csv' : 'application/xml';
-    const content = format === 'svg' ? buildSvg(enabledPanels, points, settings) : format === 'csv' ? buildCsv(enabledPanels, points, settings) : buildMmfl(enabledPanels, points, settings);
-    download(`${base}.${format}`, content, mime);
-    setMessage(t(`${format.toUpperCase()} created for ${enabledPanels.length} panel${enabledPanels.length === 1 ? '' : 's'}.`, `${format.toUpperCase()} für ${enabledPanels.length} Panel${enabledPanels.length === 1 ? '' : 's'} erstellt.`));
+    if (format === 'mmfl' && !modules.length) {
+      setError(t('Add at least one module before MMFL export.', 'Füge vor dem MMFL-Export mindestens ein Modul hinzu.'));
+      return;
+    }
+    try {
+      // The Fixture Definition is the user's canonical export name.
+      const base = safeName(settings.definition);
+      const mime = format === 'svg' ? 'image/svg+xml' : format === 'csv' ? 'text/csv' : 'application/xml';
+      const content = format === 'svg' ? buildSvg(enabledPanels, points, settings) : format === 'csv' ? buildCsv(enabledPanels, points, settings) : buildModuleMmfl(modules, points.length, settings);
+      download(`${base}.${format}`, content, mime);
+      setError('');
+      setMessage(format === 'mmfl'
+        ? t(`MMFL created from ${modules.length} modules with ${hiddenIndices.length} reserved hidden pixels.`, `MMFL aus ${modules.length} Modulen mit ${hiddenIndices.length} reservierten, ausgeblendeten Pixeln erstellt.`)
+        : t(`${format.toUpperCase()} created for ${enabledPanels.length} panel${enabledPanels.length === 1 ? '' : 's'}.`, `${format.toUpperCase()} für ${enabledPanels.length} Panel${enabledPanels.length === 1 ? '' : 's'} erstellt.`));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : t('The fixture could not be exported.', 'Die Fixture konnte nicht exportiert werden.'));
+    }
   };
   const repairReason = (reason: RepairSuggestion['reason']) => ({
     'missing-reading': t('Missing reading', 'Fehlender Messwert'),
@@ -1167,81 +1528,87 @@ export default function Home() {
           <ol className="steps">
             <li className="done"><span>✓</span><div><strong>{t('Load mapping', 'Mapping laden')}</strong><small>{numberFormat.format(points.length)} {t('coordinates', 'Koordinaten')}</small></div></li>
             <li className={selectionMode ? 'active' : ''}><span>2</span><div><strong>{t('Select region', 'Bereich wählen')}</strong><small>{t('Box or panel', 'Rahmen oder Panel')}</small></div></li>
-            <li className={showAdjust || showRepair ? 'active' : ''}><span>3</span><div><strong>{t('Review & align', 'Prüfen & ausrichten')}</strong><small>{t('Repair · rotation · size', 'Repair · Rotation · Größe')}</small></div></li>
+            <li className={stageMode === 'builder' ? 'active' : ''}><span>3</span><div><strong>{t('Build modules', 'Module bauen')}</strong><small>{t('Matrix · strip · single', 'Matrix · Streifen · Einzelpixel')}</small></div></li>
             <li className={showExport ? 'active' : ''}><span>4</span><div><strong>{t('Export', 'Exportieren')}</strong><small>SVG · CSV · MMFL</small></div></li>
           </ol>
           <button className="load-button" onClick={() => inputRef.current?.click()}>＋ {t('Load JSON / CSV map', 'JSON / CSV Map laden')}</button>
           <div className="tool-group">
             <button className={selectionMode ? 'tool active' : 'tool'} onClick={() => setSelectionMode(value => !value)}>▧ {t('Box selection', 'Rahmenauswahl')}</button>
-            <button className="tool" disabled={!selection.length} onClick={addSelection}>＋ {t('Selection as panel', 'Auswahl als Panel')}</button>
+            <button className="tool" onClick={() => setStageMode('builder')}>▦ {t('Module builder', 'Modul-Baukasten')}</button>
           </div>
           <div className="tool-group">
             <button className={showPixelNumbers ? 'tool active' : 'tool'} aria-pressed={showPixelNumbers} onClick={() => setShowPixelNumbers(value => !value)}># {t('Show pixel numbers', 'Pixelnummern anzeigen')}</button>
-            <button className={editMode ? 'tool active' : 'tool'} aria-pressed={editMode} onClick={() => setEditMode(value => !value)}>✣ {t('Pixel edit mode', 'Pixel-Bearbeitungsmodus')}</button>
+            <button className={showModuleNumbers ? 'tool active' : 'tool'} aria-pressed={showModuleNumbers} onClick={() => setShowModuleNumbers(value => !value)}># {t('Builder numbers', 'Baukasten-Nummern')}</button>
           </div>
-          <div className="tool-group">
-            <button className="tool" disabled={!active} onClick={() => setShowAdjust(true)}>↻ {t('Align active panel', 'Aktives Panel ausrichten')}</button>
-            <button className="tool repair-tool" disabled={!active} onClick={openRepairReview}>◇ {t('Review measurements', 'Messfehler prüfen')}</button>
-          </div>
-          <div className="data-card"><span>{t('Detected LED spacing', 'Erkannter LED-Abstand')}</span><strong>{pitch.toFixed(3)}</strong><small>{t('Cluster radius', 'Cluster-Radius')}: {(pitch * 3).toFixed(3)}</small></div>
+          <div className="data-card"><span>{t('Module coverage', 'Modulbelegung')}</span><strong>{assignedCount}/{points.length}</strong><small>{unassignedCount ? t(`${unassignedCount} slots still free`, `${unassignedCount} Slots noch frei`) : t('Complete · ready for MMFL', 'Vollständig · bereit für MMFL')}</small></div>
           <p className="privacy-note">{t('Your mapping file stays on this device and is never uploaded.', 'Deine Mapping-Datei bleibt auf diesem Gerät und wird nicht hochgeladen.')}</p>
         </aside>
 
         <section className="stage-card">
           <div className="stage-toolbar">
-            <div><span className="eyebrow">{stageMode === '3d' ? '3D MAP' : t('MADMAPPER 2D · LARGE VIEW', 'MADMAPPER 2D · GROSSANSICHT')}</span><h1>{stageMode === '3d' ? fileName : active?.name ?? t('No panel selected', 'Kein Panel ausgewählt')}</h1></div>
-            <div className="stage-actions"><button className="swap-button" onClick={() => setStageMode(mode => mode === '3d' ? '2d' : '3d')}>⇄ {stageMode === '3d' ? t('Large 2D', '2D groß') : t('Large 3D', '3D groß')}</button><button disabled={!active} onClick={openRepairReview}>Auto Repair</button></div>
+            <div><span className="eyebrow">{stageMode === '3d' ? '3D MAP' : t('MODULAR MMFL BUILDER', 'MODULARER MMFL-BAUKASTEN')}</span><h1>{stageMode === '3d' ? fileName : activeModule?.name ?? t('No module selected', 'Kein Modul ausgewählt')}</h1></div>
+            <div className="stage-actions"><button className="swap-button" onClick={() => setStageMode(mode => mode === '3d' ? 'builder' : '3d')}>⇄ {stageMode === '3d' ? t('Open builder', 'Baukasten öffnen') : t('Show 3D scan', '3D-Scan zeigen')}</button></div>
             {stageMode === '3d' && <div className="view-switch">{[
               { id: '3D', label: '3D' }, { id: 'Top', label: t('Top', 'Oben') }, { id: 'Front', label: 'Front' }, { id: 'Side', label: t('Side', 'Seite') },
             ].map(item => <button key={item.id} className={view === item.id ? 'selected' : ''} onClick={() => selectView(item.id)}>{item.label}</button>)}</div>}
           </div>
-          <div className={`viewport ${stageMode === '2d' ? 'viewport-2d' : ''}`}>
+          <div className={`viewport ${stageMode === 'builder' ? 'viewport-builder' : ''}`}>
             {stageMode === '3d' ? <>
-              <MapCanvas language={language} points={points} panels={panels} selectionMode={selectionMode} showPixelNumbers={showPixelNumbers} selectedIndices={selection} onSelection={selectPixels} camera={mapCamera} onCameraChange={setMapCamera} />
+              <MapCanvas language={language} points={points} panels={panels} selectionMode={selectionMode} showPixelNumbers={showPixelNumbers} hiddenIndices={hiddenIndices} selectedIndices={selection} onSelection={selectPixels} camera={mapCamera} onCameraChange={setMapCamera} />
               <div className="axis-chip"><i className="x" /> X <i className="y" /> Y <i className="z" /> Z</div>
-              <div className="canvas-help">{editMode ? t('Click/Shift-click: select · Arrows: X/Y · Page Up/Down: Z · Shift: 10×', 'Klick/Shift-Klick: Auswahl · Pfeile: X/Y · Bild↑/↓: Z · Shift: 10×') : selectionMode ? t('Drag a box to select LEDs', 'Rahmen ziehen, um LEDs zu markieren') : t('Click: select · Drag: rotate · Wheel: zoom · Shift: add selection', 'Klick: auswählen · Ziehen: drehen · Mausrad: zoomen · Shift: Auswahl ergänzen')}</div>
+              <div className="canvas-help">{selectionMode ? t('Drag a box to choose the first free LED range for a module', 'Rahmen ziehen, um den ersten freien LED-Bereich eines Moduls zu wählen') : t('Click: select · Drag: rotate · Wheel: zoom · crossed pixels are reserved/hidden', 'Klick: auswählen · Ziehen: drehen · Mausrad: zoomen · gekreuzte Pixel sind reserviert/ausgeblendet')}</div>
             </> : <>
-              <FixturePreview language={language} panel={active} points={points} ledSize={settings.ledSize} interactive showOutputGrid={showOutputGrid} onTransform={updatePanelTransform} />
-              <div className="stage-2d-controls">
-                <label><span>{t('Rotation', 'Rotation')}</span><input type="range" min="-180" max="180" step="0.1" value={active?.transform.rotation ?? 0} onChange={event => active && updatePanelTransform({ ...active.transform, rotation: Number(event.target.value) })} /><output>{active?.transform.rotation.toFixed(1) ?? '0.0'}°</output></label>
-                <div className="stage-snap-buttons"><button onClick={() => snapActive('horizontal')}>↔ Snap H</button><button onClick={() => snapActive('vertical')}>↕ Snap V</button><button className={active?.transform.flipX ? 'active' : ''} onClick={() => flipActive('horizontal')}>⇋ Flip H</button><button className={active?.transform.flipY ? 'active' : ''} onClick={() => flipActive('vertical')}>⇵ Flip V</button><button className={showOutputGrid ? 'active' : ''} onClick={() => setShowOutputGrid(value => !value)}>▦ {t('MMFL grid', 'MMFL-Raster')}</button></div>
-                <label><span>{t('Export size', 'Exportgröße')}</span><input type="range" min="0.25" max="4" step="0.01" value={active?.transform.scale ?? 1} onChange={event => active && updatePanelTransform({ ...active.transform, scale: Number(event.target.value) })} /><output>{Math.round((active?.transform.scale ?? 1) * 100)} %</output></label>
-                <button className="stage-reset" onClick={() => updatePanelTransform({ rotation: 0, scale: 1, flipX: false, flipY: false })}>{t('Reset', 'Zurücksetzen')}</button>
+              <ModulePreview language={language} modules={modules} activeId={activeModule?.id ?? ''} channels={settings.channels} showNumbers={showModuleNumbers} onSelect={setActiveModuleId} onChange={updateModule} />
+              <div className="builder-overlay">
+                <span><b>{modules.length}</b> {t('modules', 'Module')}</span>
+                <span><b>{modularGrid.width}×{modularGrid.height}</b> {t('output cells', 'Ausgabezellen')}</span>
+                <span className={unassignedCount ? 'open' : 'complete'}><b>{unassignedCount}</b> {t('free slots', 'freie Slots')}</span>
+                <span className={modularGrid.collisions.length ? 'collision' : ''}><b>{modularGrid.collisions.length}</b> {t('collisions', 'Kollisionen')}</span>
               </div>
-              <div className="canvas-help">{t('Drag: rotate · Wheel: export size', 'Ziehen: drehen · Mausrad: Exportgröße')}</div>
+              <div className="canvas-help">{t('Click: select module · Drag: move module · edit exact size and rotation on the right', 'Klick: Modul wählen · Ziehen: Modul verschieben · exakte Größe und Rotation rechts bearbeiten')}</div>
             </>}
           </div>
-          <div className="stage-footer"><span><b>{numberFormat.format(points.length)}</b> Slots</span><span><b>{panels.length}</b> {t('regions', 'Bereiche')}</span>{inferred > 0 && <span className="inferred-count"><b>{inferred}</b> {t('auto-positioned', 'automatisch positioniert')}</span>}<button className={`warning-button ${reviewWarnings ? 'warning' : ''}`} onClick={openRepairReview}><b>{reviewWarnings}</b> {t('review warnings', 'Warnungen prüfen')}</button><span className="status-message">{message}</span></div>
+          <div className="stage-footer"><span><b>{numberFormat.format(points.length)}</b> Slots</span><span><b>{assignedCount}</b> {t('assigned', 'zugewiesen')}</span><span className={unassignedCount ? 'warning-text' : 'inferred-count'}><b>{unassignedCount}</b> {t('open', 'offen')}</span><span><b>{hiddenIndices.length}</b> {t('reserved/hidden', 'reserviert/ausgeblendet')}</span><span className="status-message">{message}</span></div>
         </section>
 
         <aside className="rail right-rail">
-          <div className="panel-heading"><div><span className="eyebrow">{t('REGIONS', 'BEREICHE')}</span><h2>{t('Panels & export', 'Panels & Export')}</h2></div><span className="count-chip">{enabledPanels.length}/{panels.length}</span></div>
+          <div className="panel-heading"><div><span className="eyebrow">{t('SCAN REGIONS', 'SCAN-BEREICHE')}</span><h2>{t('Module builder', 'Modul-Baukasten')}</h2></div><span className="count-chip">{modules.length}</span></div>
           <div className="panel-list">{panels.map(panel => <div className={`panel-row ${panel.id === active?.id ? 'chosen' : ''}`} key={panel.id}><button className="panel-main" onClick={() => setActiveId(panel.id)}><span className="color-dot" style={{ background: panel.color }} /><span><strong>{panel.name}</strong><small>{numberFormat.format(panel.indices.length)} LEDs · #{panel.indices[0]}–{panel.indices.at(-1)}</small></span></button><label className="switch" title={t('Enabled for export', 'Für Export aktiv')}><input type="checkbox" checked={panel.enabled} onChange={() => togglePanel(panel.id)} /><i /></label></div>)}</div>
-          <section className="pixel-inspector">
-            <div className="inspector-title"><span className="eyebrow">{t('PIXEL EDITOR', 'PIXEL-EDITOR')}</span><span>{selection.length ? t(`${selection.length} selected`, `${selection.length} ausgewählt`) : t('No selection', 'Keine Auswahl')}</span></div>
-            <div className="pixel-search"><input aria-label={t('Pixel number', 'Pixelnummer')} type="number" min="1" max={points.length} placeholder={t('Pixel #', 'Pixel #')} value={pixelSearch} onChange={event => setPixelSearch(event.target.value)} onKeyDown={event => event.key === 'Enter' && searchForPixel()} /><button onClick={searchForPixel}>{t('Find', 'Suchen')}</button></div>
-            {selectedPoint ? <>
-              <div className="selected-pixel-heading"><strong>Pixel #{selectedPoint.sourceIndex + 1}</strong><span className={`pixel-status ${selectedPoint.status}`}>{selectedPoint.status}</span></div>
-              <div className="coordinate-grid">{(['X', 'Y', 'Z'] as const).map((axis, index) => <label key={axis}><span>{axis}</span><input type="number" step="any" value={selectedPoint.xyz[index]} onChange={event => updateCoordinate(index as 0 | 1 | 2, Number(event.target.value))} /></label>)}</div>
-            </> : selection.length > 1 ? <p className="multi-selection-note">{t('Use the controls or keyboard to move all selected pixels together.', 'Mit den Tasten oder Schaltflächen werden alle ausgewählten Pixel gemeinsam verschoben.')}</p> : <p className="multi-selection-note">{t('Click a pixel in the 3D view to inspect it.', 'Klicke ein Pixel in der 3D-Ansicht an, um es zu bearbeiten.')}</p>}
-            <div className="edit-mode-row"><button className={editMode ? 'active' : ''} onClick={() => setEditMode(value => !value)}>✣ {t('Edit mode', 'Edit-Modus')}</button><label><span>{t('Step', 'Schritt')}</span><input type="number" min="0.0001" step="0.01" value={moveStep} onChange={event => setMoveStep(Math.max(.0001, Number(event.target.value) || .1))} /></label></div>
-            <div className="nudge-grid"><button disabled={!selection.length} onClick={() => moveSelected([-moveStep, 0, 0])}>X−</button><button disabled={!selection.length} onClick={() => moveSelected([moveStep, 0, 0])}>X＋</button><button disabled={!selection.length} onClick={() => moveSelected([0, -moveStep, 0])}>Y−</button><button disabled={!selection.length} onClick={() => moveSelected([0, moveStep, 0])}>Y＋</button><button disabled={!selection.length} onClick={() => moveSelected([0, 0, -moveStep])}>Z−</button><button disabled={!selection.length} onClick={() => moveSelected([0, 0, moveStep])}>Z＋</button></div>
-            <small className="keyboard-hint">{t('Keyboard: arrows move X/Y, Page Up/Down moves Z; Shift = 10×.', 'Tastatur: Pfeile verschieben X/Y, Bild↑/↓ verschiebt Z; Shift = 10×.')}</small>
-            <div className="insert-pixel"><input aria-label={t('Insert at pixel number', 'Bei Pixelnummer einfügen')} type="number" min="1" max={points.length + 1} placeholder={selectedPoint ? String(selectedPoint.sourceIndex + 2) : String(points.length + 1)} value={insertAt} onChange={event => setInsertAt(event.target.value)} /><button disabled={!active} onClick={insertPixel}>＋ {t('Insert pixel', 'Pixel einfügen')}</button></div>
+          <section className="module-builder">
+            <div className="coverage-card">
+              <div><span>{t('Assigned', 'Zugewiesen')}</span><strong>{assignedCount}/{points.length}</strong></div>
+              <div className="coverage-bar"><i style={{ width: `${points.length ? assignedCount / points.length * 100 : 0}%` }} /></div>
+              <small>{unassignedCount ? t(`${unassignedCount} LED slots still need a module.`, `${unassignedCount} LED-Slots benötigen noch ein Modul.`) : t('Every physical LED slot is assigned exactly once.', 'Jeder physische LED-Slot ist genau einmal zugewiesen.')}</small>
+            </div>
+            <div className="free-ranges"><span>{t('Free contiguous ranges', 'Freie zusammenhängende Bereiche')}</span><div>{freeRanges.length ? freeRanges.map(range => <button key={range.first} onClick={() => { setSelection([range.first]); setStageMode('3d'); }}>{`#${range.first + 1}–${range.last + 1}`} <b>{range.last - range.first + 1}</b></button>) : <em>{t('none', 'keine')}</em>}</div></div>
+            <div className="module-create">
+              <div className="kind-tabs">{([
+                ['matrix', t('Matrix', 'Matrix')], ['strip', t('Strip', 'Streifen')], ['single', t('Single', 'Einzelpixel')],
+              ] as [PixelModuleKind, string][]).map(([kind, label]) => <button key={kind} className={moduleKind === kind ? 'active' : ''} onClick={() => setModuleKind(kind)}>{label}</button>)}</div>
+              {moduleKind === 'matrix' && <div className="module-size-fields"><label>{t('Rows', 'Zeilen')}<input type="number" min="1" max={Math.max(1, Math.min(128, Math.floor(largestFreeRun / Math.max(moduleColumns, 1))))} value={moduleRows} onChange={event => { const rows = Math.max(1, Math.min(128, Number(event.target.value) || 1)); setModuleRows(rows); setModuleColumns(columns => Math.max(1, Math.min(columns, Math.floor(Math.max(largestFreeRun, 1) / rows)))); }} /></label><span>×</span><label>{t('Columns', 'Spalten')}<input type="number" min="1" max={Math.max(1, Math.min(128, Math.floor(largestFreeRun / Math.max(moduleRows, 1))))} value={moduleColumns} onChange={event => setModuleColumns(Math.max(1, Math.min(128, Math.floor(Math.max(largestFreeRun, 1) / Math.max(moduleRows, 1)), Number(event.target.value) || 1)))} /></label></div>}
+              {moduleKind === 'strip' && <label className="module-length">{t('Strip length', 'Streifenlänge')}<input type="number" min="1" max={Math.max(1, largestFreeRun)} value={moduleLength} onChange={event => setModuleLength(Math.max(1, Math.min(Math.max(largestFreeRun, 1), Number(event.target.value) || 1)))} /></label>}
+              {moduleKind === 'single' && <p className="single-note">{t('Uses the next single free LED slot.', 'Verwendet den nächsten einzelnen freien LED-Slot.')}</p>}
+              <div className={`fit-note ${draftFitsNext ? 'valid' : 'invalid'}`}><b>{draftModuleCount}</b> {t('LED slots requested', 'LED-Slots benötigt')} · {t('largest free run', 'größter freier Bereich')}: <b>{largestFreeRun}</b></div>
+              <div className="create-actions"><button disabled={!draftFitsNext} onClick={() => addModule(false)}>＋ {t('Add next free', 'Nächsten freien hinzufügen')}</button><button disabled={!draftFitsSelection} onClick={() => addModule(true)}>▧ {t('From selection', 'Ab Auswahl')}</button></div>
+              {selectionStart >= 0 && <small className="selection-capacity">#{selectionStart + 1}: {selectionFreeCapacity} {t('consecutive free slots available', 'aufeinanderfolgende freie Slots verfügbar')}</small>}
+              <button className="fill-free" disabled={!freeRanges.length} onClick={fillFreeAsStrips}>{t('Fill every remaining range as a strip', 'Alle restlichen Bereiche als Streifen füllen')}</button>
+            </div>
+            <div className="module-list">{modules.map(module => <button className={module.id === activeModule?.id ? 'active' : ''} key={module.id} onClick={() => { setActiveModuleId(module.id); setStageMode('builder'); }}><i style={{ background: module.color }} /><span><strong>{module.name}</strong><small>#{module.startIndex + 1}–{module.startIndex + modulePixelCount(module)} · {module.rows}×{module.columns}{module.hiddenIndices.length ? ` · ${module.hiddenIndices.length} ${t('hidden', 'ausgeblendet')}` : ''}</small></span></button>)}</div>
+            {activeModule && <div className="module-editor">
+              <div className="module-editor-title"><span>{t('Active module', 'Aktives Modul')}</span><button onClick={() => removeModule(activeModule.id)}>{t('Remove', 'Entfernen')}</button></div>
+              <label>{t('Name', 'Name')}<input value={activeModule.name} onChange={event => updateModule({ ...activeModule, name: event.target.value })} /></label>
+              <div className="module-meta"><span>{t('Assigned range', 'Zugewiesener Bereich')} <b>#{activeModule.startIndex + 1}–{activeModule.startIndex + modulePixelCount(activeModule)}</b></span><span>{activeModule.wiringDetected ? t('scan-assisted', 'scan-unterstützt') : t('manual wiring', 'manuelle Verdrahtung')}</span></div>
+              <div className="module-grid-fields"><label>{t('Flow', 'Verlauf')}<select value={activeModule.order} onChange={event => updateModule({ ...activeModule, order: event.target.value as ModuleOrder, wiringDetected: false })}><option value="rows">{t('Rows first', 'Zeilen zuerst')}</option><option value="columns">{t('Columns first', 'Spalten zuerst')}</option></select></label><label>{t('Start corner', 'Startecke')}<select value={activeModule.startCorner} onChange={event => updateModule({ ...activeModule, startCorner: event.target.value as ModuleCorner, wiringDetected: false })}><option value="tl">↖ TL</option><option value="tr">↗ TR</option><option value="bl">↙ BL</option><option value="br">↘ BR</option></select></label></div>
+              <label className="check-row"><input type="checkbox" checked={activeModule.zigzag} onChange={event => updateModule({ ...activeModule, zigzag: event.target.checked, wiringDetected: false })} /> {t('Zigzag / serpentine wiring', 'Zickzack-/Serpentinen-Verdrahtung')}</label>
+              <button className="detect-wiring" onClick={redetectWiring}>◇ {t('Detect wiring from scan', 'Verdrahtung aus Scan erkennen')}</button>
+              <div className="geometry-title">{t('Physical placement before MMFL grid', 'Physische Platzierung vor dem MMFL-Raster')}</div>
+              <div className="geometry-grid">{([
+                ['X', 'x', .1], ['Y', 'y', .1], [t('Width', 'Breite'), 'width', .1], [t('Height', 'Höhe'), 'height', .1], [t('Rotation', 'Rotation'), 'rotation', 1],
+              ] as [string, 'x' | 'y' | 'width' | 'height' | 'rotation', number][]).map(([label, key, step]) => <label key={key}>{label}<input type="number" step={step} min={key === 'width' || key === 'height' ? 0 : undefined} value={activeModule[key]} onChange={event => updateModule({ ...activeModule, [key]: Number(event.target.value) || 0 })} /></label>)}</div>
+              <div className="hidden-editor"><div><span>{t('Physically present but unused', 'Physisch vorhanden, aber unbenutzt')}</span><small>{t('Hidden cells reserve their source/DMX address; later LEDs keep their original address.', 'Ausgeblendete Zellen reservieren ihre Quell-/DMX-Adresse; spätere LEDs behalten ihre Originaladresse.')}</small></div><div className="hidden-input"><input type="number" min={activeModule.startIndex + 1} max={activeModule.startIndex + modulePixelCount(activeModule)} placeholder={t('Pixel #', 'Pixel #')} value={hiddenPixelInput} onChange={event => setHiddenPixelInput(event.target.value)} /><button onClick={() => toggleHiddenPixel(Number(hiddenPixelInput) - 1)}>{t('Toggle', 'Umschalten')}</button></div>{activeModule.hiddenIndices.length > 0 && <div className="hidden-chips">{activeModule.hiddenIndices.map(index => <button key={index} onClick={() => toggleHiddenPixel(index)}>#{index + 1} ×</button>)}</div>}</div>
+            </div>}
           </section>
-          {stageMode === '3d' ? <div className="fixture-preview">
-            <div className="preview-title"><span className="eyebrow">{t('MADMAPPER 2D PREVIEW', 'MADMAPPER 2D-VORSCHAU')}</span><span>{active?.name ?? '—'}</span></div>
-            <FixturePreview language={language} panel={active} points={points} ledSize={settings.ledSize} showOutputGrid={showOutputGrid} />
-            <div className="preview-metrics"><span>{active ? `${active.transform.rotation.toFixed(1)}°` : '—'}</span><span>{active ? `${Math.round(active.transform.scale * 100)} %` : '—'}</span>{active?.transform.flipX && <span>Flip H</span>}{active?.transform.flipY && <span>Flip V</span>}</div>
-            <div className="preview-actions"><button onClick={() => setStageMode('2d')}>⇄ {t('Show large', 'Groß anzeigen')}</button><button className={showOutputGrid ? 'active' : ''} onClick={() => setShowOutputGrid(value => !value)}>▦ {t('Grid', 'Raster')}</button><button onClick={openRepairReview}>◇ Auto Repair</button></div>
-            <p>{t('Best-fit plane · source order is preserved', 'Best-Fit-Ebene · Quellreihenfolge bleibt erhalten')}</p>
-          </div> : <div className="fixture-preview swapped-preview">
-            <div className="preview-title"><span className="eyebrow">{t('3D ORIENTATION', '3D-ORIENTIERUNG')}</span><span>{viewLabel}</span></div>
-            <div className="mini-map-viewport"><MapCanvas language={language} points={points} panels={panels} selectionMode={false} showPixelNumbers={false} selectedIndices={selection} onSelection={() => undefined} camera={mapCamera} onCameraChange={setMapCamera} /></div>
-            <div className="preview-actions one"><button onClick={() => setStageMode('3d')}>⇄ {t('Show large 3D', '3D groß anzeigen')}</button></div>
-            <p>{t('The camera position is retained when switching views.', 'Die Kameraposition bleibt beim Wechsel erhalten.')}</p>
-          </div>}
-          <button className="export-button" onClick={() => setShowExport(true)}>{t('Create fixture', 'Fixture erstellen')} <span>→</span></button>
+          <button className="export-button" disabled={!modules.length} onClick={() => setShowExport(true)}>{t('Create fixture', 'Fixture erstellen')} <span>→</span></button>
         </aside>
       </section>
 
@@ -1281,11 +1648,12 @@ export default function Home() {
       </section></div>}
 
       {showExport && <div className="modal-backdrop" onMouseDown={() => setShowExport(false)}><section className="modal" onMouseDown={event => event.stopPropagation()} aria-modal="true" role="dialog" aria-labelledby="export-title">
-        <button className="modal-close" aria-label={t('Close', 'Schließen')} onClick={() => setShowExport(false)}>×</button><span className="eyebrow">EXPORT</span><h2 id="export-title">{t('Create MadMapper fixture', 'MadMapper Fixture erstellen')}</h2><p className="modal-lead">{enabledPanels.length} {t(enabledPanels.length === 1 ? 'panel' : 'panels', enabledPanels.length === 1 ? 'Panel' : 'Panels')} · {numberFormat.format(enabledPanels.reduce((sum, panel) => sum + panel.indices.length, 0))} LEDs · {t('original order preserved', 'in Originalreihenfolge')}</p>
+        <button className="modal-close" aria-label={t('Close', 'Schließen')} onClick={() => setShowExport(false)}>×</button><span className="eyebrow">EXPORT</span><h2 id="export-title">{t('Create MadMapper fixture', 'MadMapper Fixture erstellen')}</h2><p className="modal-lead">{t('MMFL uses the modular output grid. SVG and CSV continue to use the enabled scan regions.', 'MMFL verwendet das modulare Ausgaberaster. SVG und CSV verwenden weiterhin die aktivierten Scan-Bereiche.')}</p>
+        <div className="export-summary"><span>{t('Modules', 'Module')}<b>{modules.length}</b></span><span>{t('Assigned', 'Zugewiesen')}<b>{assignedCount}/{points.length}</b></span><span>{t('Hidden', 'Ausgeblendet')}<b>{hiddenIndices.length}</b></span><span>{t('Grid', 'Raster')}<b>{modularGrid.width}×{modularGrid.height}</b></span><span className={modularGrid.collisions.length ? 'bad' : ''}>{t('Collisions', 'Kollisionen')}<b>{modularGrid.collisions.length}</b></span></div>
         <div className="form-grid"><label>Fixture Definition<input value={settings.definition} onChange={event => setSettings(current => ({ ...current, definition: event.target.value }))} /></label><label>{t('Channels per pixel', 'Kanäle pro Pixel')}<select value={settings.channels} onChange={event => setSettings(current => ({ ...current, channels: Number(event.target.value), definition: Number(event.target.value) === 4 ? 'Generic - Pixel RGBW' : 'Generic - Pixel RGB' }))}><option value={3}>RGB · 3</option><option value={4}>RGBW · 4</option></select></label><label>{t('Start universe', 'Start Universe')}<input type="number" min="0" max="32767" value={settings.universe} onChange={event => setSettings(current => ({ ...current, universe: Math.max(0, Number(event.target.value)) }))} /></label><label>{t('Start channel', 'Start Channel')}<input type="number" min="1" max="512" value={settings.channel} onChange={event => setSettings(current => ({ ...current, channel: Math.max(1, Math.min(512, Number(event.target.value))) }))} /></label><label>{t('Pixel size in MadMapper', 'Pixelgröße in MadMapper')}<input type="number" min="1" max="64" value={settings.ledSize} onChange={event => setSettings(current => ({ ...current, ledSize: Math.max(1, Number(event.target.value)) }))} /></label></div>
         <p className="file-name-preview">{t('Saved as', 'Wird gespeichert als')}: <strong>{safeName(settings.definition)}.[svg/csv/mmfl]</strong></p>
-        <div className="format-cards"><button onClick={() => exportFile('svg')}><b>SVG 6.1</b><span>{t('Recommended', 'Empfohlen')}</span><small>{t('Exact freeform 2D positions, groups and DMX patch.', 'Exakte freie 2D-Positionen, Gruppen und DMX-Patch.')}</small></button><button onClick={() => exportFile('csv')}><b>CSV</b><span>{t('Alternative', 'Alternative')}</span><small>{t('Individual pixels with position, definition and patch.', 'Einzelpixel mit Position, Definition und Patch.')}</small></button><button onClick={() => exportFile('mmfl')}><b>MMFL</b><span>{t('Experimental', 'Experimentell')}</span><small>{t('Quantised grid; MadMapper fixture name comes from Fixture Definition.', 'Quantisiertes Raster; der MadMapper-Fixturename stammt aus Fixture Definition.')}</small></button></div>
-        <div className="format-note"><strong>{t('Why 2D?', 'Warum 2D?')}</strong> {t('MadMapper does not import true XYZ fixture coordinates. The app projects every selected panel onto its local plane without altering the 3D map.', 'MadMapper importiert keine echten XYZ-Fixture-Koordinaten. Die App projiziert jedes gewählte Panel verlustarm auf seine lokale Ebene; die 3D-Map bleibt unverändert.')}</div>
+        <div className="format-cards"><button onClick={() => exportFile('svg')}><b>SVG 6.1</b><span>{t('Freeform', 'Freiform')}</span><small>{t('Exact projected positions and DMX patch from enabled scan regions.', 'Exakte projizierte Positionen und DMX-Patch aus aktivierten Scan-Bereichen.')}</small></button><button onClick={() => exportFile('csv')}><b>CSV</b><span>{t('Table', 'Tabelle')}</span><small>{t('Individual fixtures with position, definition and patch.', 'Einzel-Fixtures mit Position, Definition und Patch.')}</small></button><button disabled={unassignedCount > 0 || modularGrid.collisions.length > 0} onClick={() => exportFile('mmfl')}><b>MMFL</b><span>{t('Modular grid', 'Modulraster')}</span><small>{unassignedCount ? t(`Assign ${unassignedCount} remaining LED slots first.`, `Weise zuerst die ${unassignedCount} übrigen LED-Slots zu.`) : modularGrid.collisions.length ? t(`Resolve ${modularGrid.collisions.length} grid collisions first.`, `Löse zuerst ${modularGrid.collisions.length} Rasterkollisionen.`) : t('Ready: hidden pixels remain empty while reserving their original channel offsets.', 'Bereit: ausgeblendete Pixel bleiben leer und reservieren ihre ursprünglichen Kanalabstände.')}</small></button></div>
+        <div className="format-note"><strong>{t('Hidden LED compatibility', 'Kompatibilität ausgeblendeter LEDs')}</strong> {t('MMFL has no publicly documented hidden-pixel flag. Pixel Fixture Studio therefore writes the cell as empty (0) but calculates every later address from the original source index. This preserves physical wiring and DMX offsets.', 'MMFL besitzt kein öffentlich dokumentiertes Kennzeichen für ausgeblendete Pixel. Pixel Fixture Studio schreibt die Zelle deshalb leer (0), berechnet aber jede spätere Adresse aus dem ursprünglichen Quellindex. So bleiben physische Verdrahtung und DMX-Abstände erhalten.')}</div>
       </section></div>}
 
       {showHelp && <div className="modal-backdrop" onMouseDown={() => setShowHelp(false)}><section className="modal help-modal" onMouseDown={event => event.stopPropagation()} aria-modal="true" role="dialog" aria-labelledby="help-title">
@@ -1293,7 +1661,8 @@ export default function Home() {
         <div className="help-row"><b>Import</b><p>{t('Pixelblaze JSON, Marimapper 3D CSV ', 'Pixelblaze-JSON sowie Marimapper-3D-CSV ')}(<code>index,x,y,z,xn,yn,zn,error</code>) {t('and 2D CSV ', 'und 2D-CSV ')}(<code>index,u,v</code>). {t('For CSV files, the app asks for the expected LED count. Only internal gaps are automatic; extra trailing LEDs require an explicitly larger count. Missing entries are positioned from locally detected zigzag rows, allowing multiple matrix sizes in one scan, then marked as inferred and included in export.', 'Bei CSV-Dateien fragt die App nach der erwarteten LED-Anzahl. Nur interne Lücken werden automatisch ergänzt; zusätzliche Endpixel erfordern eine ausdrücklich größere Anzahl. Fehlende Einträge werden aus lokal erkannten Zickzack-Zeilen positioniert, sodass mehrere Matrixgrößen in einem Scan möglich sind; anschließend werden sie als berechnet markiert und exportiert.')}</p></div>
         <div className="help-row"><b>SVG 6.1</b><p>{t('Use File → Import Fixtures. Each LED becomes its own fixture with current ', 'Für File → Import Fixtures. Jede LED wird als eigenes Fixture mit aktuellen ')}<code>universe</code>, <code>channel</code> {t('and', 'und')} <code>fixture_definition</code> {t('attributes.', 'Attributen angelegt.')}</p></div>
         <div className="help-row"><b>CSV</b><p>{t('A robust table alternative for fixture instances, semicolon-delimited and grouped by panel path.', 'Robuste Tabellenalternative für Fixture-Instanzen. Semikolon-getrennt und mit Gruppenpfaden pro Panel.')}</p></div>
-        <div className="help-row"><b>MMFL</b><p>{t('For import in the Fixture Editor. It describes a 2D pixel grid and channel layout. The MadMapper product name is taken from Fixture Definition; multi-panel exports add the panel name for uniqueness. Internal details are not fully documented publicly.', 'Für den Import im Fixture Editor. Das Format beschreibt ein 2D-Pixelraster und die Kanalbelegung. Der MadMapper-Produktname wird aus Fixture Definition übernommen; bei mehreren Panels wird zur Unterscheidung der Panelname ergänzt. Die internen Details sind nicht vollständig öffentlich dokumentiert.')}</p></div>
+        <div className="help-row"><b>{t('Builder', 'Baukasten')}</b><p>{t('Assign every imported LED exactly once to a matrix, strip or single-pixel module. Only module sizes that fit a remaining contiguous free range can be added. Drag modules in the 2D builder, then fine-tune X, Y, width, height and rotation.', 'Ordne jede importierte LED genau einmal einem Matrix-, Streifen- oder Einzelpixel-Modul zu. Hinzufügen lassen sich nur Modulgrößen, die in einen verbleibenden zusammenhängenden freien Bereich passen. Module im 2D-Baukasten ziehen und anschließend X, Y, Breite, Höhe und Rotation fein einstellen.')}</p></div>
+        <div className="help-row"><b>MMFL</b><p>{t('For import in the Fixture Editor. The product name comes from Fixture Definition. A physically present but unused LED is stored as an empty grid cell; later LED addresses still derive from their original source indices, so the unused LED continues to reserve its wiring/DMX position.', 'Für den Import im Fixture Editor. Der Produktname stammt aus Fixture Definition. Eine physisch vorhandene, aber unbenutzte LED wird als leere Rasterzelle gespeichert; spätere LED-Adressen werden weiterhin aus ihren ursprünglichen Quellindizes berechnet, sodass die unbenutzte LED ihre Verdrahtungs-/DMX-Position reserviert.')}</p></div>
         <div className="help-warning">{t('Legacy MadMapper 5 SVG attributes are intentionally omitted. The export follows the current 6.1 documentation.', 'Alte MadMapper-5-SVG-Attribute werden bewusst nicht verwendet. Der Export folgt der aktuellen 6.1-Dokumentation.')}</div>
       </section></div>}
     </main>
