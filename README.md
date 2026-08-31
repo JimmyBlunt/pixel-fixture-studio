@@ -22,6 +22,7 @@ The hosted app currently uses access-controlled Sites hosting. Everyone can run 
 - Scan-assisted zigzag, row/column flow, and start-corner detection with manual overrides
 - Immediate module draft after CSV import: repeated row returns become matrices, serpentine reversals determine likely row length, and unmatched runs remain strips
 - Per-module X/Y placement, physical width/height, rotation, and an export-exact MMFL preview
+- Scan-view layout transfer: suggested modules inherit their relative centre, projected orientation, and size from the retained 3D camera, with one-click re-alignment after rotating the scan
 - Strict coverage rules: each imported LED slot is assigned once, and only modules that fit a remaining contiguous range can be added
 - Reserved hidden LEDs remain part of the wiring order and DMX address spacing without rendering a visible MMFL cell
 - MadMapper 6.1 SVG, CSV, and experimental MMFL exports

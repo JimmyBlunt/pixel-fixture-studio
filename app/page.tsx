@@ -377,12 +377,111 @@ function detectModuleWiring(module: PixelModule, points: MapPoint[], panels: Pan
   };
 }
 
+/** Project the imported coordinates exactly like the interactive 3D camera, but in scan units. */
+function projectScanToCamera(points: MapPoint[], camera: Camera) {
+  const usable = points.filter(point => point.status !== 'placeholder' && point.xyz.every(Number.isFinite));
+  const center: Vec3 = [0, 0, 0];
+  usable.forEach(point => point.xyz.forEach((value, axis) => { center[axis] += value / Math.max(usable.length, 1); }));
+  const cy = Math.cos(camera.yaw), sy = Math.sin(camera.yaw), cp = Math.cos(camera.pitch), sp = Math.sin(camera.pitch);
+  return new Map(usable.map(point => {
+    const x = point.xyz[0] - center[0], y = point.xyz[1] - center[1], z = point.xyz[2] - center[2];
+    const u = x * cy - z * sy, depth = x * sy + z * cy, vertical = y * cp - depth * sp;
+    return [point.sourceIndex, { u, v: -vertical }] as const;
+  }));
+}
+
+function averageVector(vectors: { u: number; v: number }[]) {
+  if (!vectors.length) return null;
+  return vectors.reduce((sum, vector) => ({ u: sum.u + vector.u / vectors.length, v: sum.v + vector.v / vectors.length }), { u: 0, v: 0 });
+}
+
+/**
+ * Preserve the relative arrangement visible in the 3D camera when constructing the editable
+ * orthogonal MMFL modules. Each module gets a scan-derived centre, rotation and projected size.
+ */
+function alignModulesToScanView(modules: PixelModule[], points: MapPoint[], camera: Camera, pitch: number) {
+  const projected = projectScanToCamera(points, camera);
+  const safePitch = Math.max(pitch, .0001);
+  const aligned = modules.map(module => {
+    const cellPoints = moduleIndices(module).flatMap(sourceIndex => {
+      const position = projected.get(sourceIndex);
+      if (!position) return [];
+      const local = moduleLocalCell(module, sourceIndex - module.startIndex);
+      return [{ sourceIndex, row: local.row, column: local.column, ...position }];
+    });
+    if (!cellPoints.length) return module;
+    const byCell = new Map(cellPoints.map(point => [`${point.row}:${point.column}`, point]));
+    const horizontal: { u: number; v: number }[] = [], vertical: { u: number; v: number }[] = [];
+    cellPoints.forEach(point => {
+      const right = byCell.get(`${point.row}:${point.column + 1}`);
+      if (right) horizontal.push({ u: right.u - point.u, v: right.v - point.v });
+      const below = byCell.get(`${point.row + 1}:${point.column}`);
+      if (below) vertical.push({ u: below.u - point.u, v: below.v - point.v });
+    });
+    const columnVector = averageVector(horizontal), rowVector = averageVector(vertical);
+    const columnStep = columnVector ? Math.hypot(columnVector.u, columnVector.v) / safePitch : 1;
+    const rowStep = rowVector ? Math.hypot(rowVector.u, rowVector.v) / safePitch : 1;
+    // Never compress below one MMFL cell per physical step: perspective may make a panel
+    // appear edge-on, but its output grid must still keep every LED in a unique cell.
+    const width = module.columns > 1 ? Math.max(1, columnStep) * (module.columns - 1) : 0;
+    const height = module.rows > 1 ? Math.max(1, rowStep) * (module.rows - 1) : 0;
+    const columnSpan = columnVector ? Math.hypot(columnVector.u, columnVector.v) * Math.max(module.columns - 1, 1) : 0;
+    const rowSpan = rowVector ? Math.hypot(rowVector.u, rowVector.v) * Math.max(module.rows - 1, 1) : 0;
+    const direction = rowVector && rowSpan > columnSpan
+      ? Math.atan2(rowVector.v, rowVector.u) - Math.PI / 2
+      : columnVector ? Math.atan2(columnVector.v, columnVector.u) : rowVector ? Math.atan2(rowVector.v, rowVector.u) - Math.PI / 2 : 0;
+    const center = cellPoints.reduce((sum, point) => ({ u: sum.u + point.u / cellPoints.length, v: sum.v + point.v / cellPoints.length }), { u: 0, v: 0 });
+    return {
+      ...module,
+      x: center.u / safePitch - width / 2,
+      y: center.v / safePitch - height / 2,
+      width,
+      height,
+      rotation: normalizeDegrees(direction * 180 / Math.PI),
+    };
+  });
+  // A 3D camera can visually overlap panels that live at different depths. MMFL is a single
+  // plane, so gently separate their rotated bounds while retaining the scan-derived ordering
+  // and orientation. This keeps the automatic draft exportable instead of creating collisions.
+  let separated = aligned.map(module => ({ ...module }));
+  for (let iteration = 0; iteration < 80; iteration++) {
+    const bounds = separated.map(module => {
+      const cells = moduleCells(module, 3);
+      return {
+        minX: Math.min(...cells.map(cell => cell.x)), maxX: Math.max(...cells.map(cell => cell.x)),
+        minY: Math.min(...cells.map(cell => cell.y)), maxY: Math.max(...cells.map(cell => cell.y)),
+      };
+    });
+    let moved = false;
+    for (let left = 0; left < separated.length; left++) for (let right = left + 1; right < separated.length; right++) {
+      const overlapX = Math.min(bounds[left].maxX, bounds[right].maxX) - Math.max(bounds[left].minX, bounds[right].minX) + 2;
+      const overlapY = Math.min(bounds[left].maxY, bounds[right].maxY) - Math.max(bounds[left].minY, bounds[right].minY) + 2;
+      if (overlapX <= 0 || overlapY <= 0) continue;
+      moved = true;
+      if (overlapX < overlapY) {
+        const leftCenter = (bounds[left].minX + bounds[left].maxX) / 2, rightCenter = (bounds[right].minX + bounds[right].maxX) / 2;
+        const direction = leftCenter <= rightCenter ? -1 : 1, amount = overlapX / 2 + .05;
+        separated[left].x += direction * amount; separated[right].x -= direction * amount;
+      } else {
+        const leftCenter = (bounds[left].minY + bounds[left].maxY) / 2, rightCenter = (bounds[right].minY + bounds[right].maxY) / 2;
+        const direction = leftCenter <= rightCenter ? -1 : 1, amount = overlapY / 2 + .05;
+        separated[left].y += direction * amount; separated[right].y -= direction * amount;
+      }
+    }
+    if (!moved) break;
+  }
+  const cells = separated.flatMap(module => moduleCells(module, 3));
+  if (!cells.length) return aligned;
+  const offsetX = 2 - Math.min(...cells.map(cell => cell.x)), offsetY = 2 - Math.min(...cells.map(cell => cell.y));
+  return separated.map(module => ({ ...module, x: module.x + offsetX, y: module.y + offsetY }));
+}
+
 /**
  * Build an editable first draft from the measured index path. Large, regularly repeated
  * return jumps describe row-major matrices; close direction reversals describe serpentine
  * matrices. Isolated runs remain strips. The result always covers every confirmed slot once.
  */
-function suggestModulesFromScan(points: MapPoint[], panels: Panel[], pitch: number) {
+function suggestModulesFromScan(points: MapPoint[], panels: Panel[], pitch: number, camera: Camera) {
   if (!points.length) return [] as PixelModule[];
   const resetEdges: { after: number; distance: number }[] = [];
   for (let index = 0; index < points.length - 1; index++) {
@@ -433,8 +532,7 @@ function suggestModulesFromScan(points: MapPoint[], panels: Panel[], pitch: numb
     offset++;
   }
 
-  let cursorX = 0, cursorY = 0, shelfHeight = 0;
-  return drafts.map((draft, index) => {
+  const suggestions = drafts.map((draft, index) => {
     const kind: PixelModuleKind = draft.rows > 1 ? 'matrix' : draft.columns > 1 ? 'strip' : 'single';
     let module = makeModule(
       draft.rows > 1 ? `${draft.rows}×${draft.columns} ${translated('en', 'Suggested matrix', 'Vorgeschlagene Matrix')}` : `${draft.columns} LED Suggested strip`,
@@ -446,16 +544,9 @@ function suggestModulesFromScan(points: MapPoint[], panels: Panel[], pitch: numb
     );
     module = detectModuleWiring(module, points, panels, pitch);
     module = { ...module, zigzag: draft.zigzag, wiringDetected: draft.confidence === 'high' || module.wiringDetected };
-    if (cursorX > 0 && cursorX + module.width > 64) {
-      cursorX = 0;
-      cursorY += shelfHeight + 4;
-      shelfHeight = 0;
-    }
-    module = { ...module, x: cursorX, y: cursorY };
-    cursorX += module.width + 4;
-    shelfHeight = Math.max(shelfHeight, module.height);
     return module;
   });
+  return alignModulesToScanView(suggestions, points, camera, pitch);
 }
 
 function buildModuleMmfl(modules: PixelModule[], total: number, settings: ExportSettings) {
@@ -1309,7 +1400,7 @@ export default function Home() {
     const recovered = missingIndices.size ? placeMissingCoordinates(analyzed.points, analyzed.panels, analyzed.pitch, missingIndices) : { points: analyzed.points, panels: analyzed.panels, placed: 0, unresolved: 0 };
     setPoints(recovered.points);
     setPanels(recovered.panels);
-    const suggestions = suggestModulesFromScan(recovered.points, recovered.panels, analyzed.pitch);
+    const suggestions = suggestModulesFromScan(recovered.points, recovered.panels, analyzed.pitch, mapCamera);
     setModules(suggestions);
     setActiveModuleId(suggestions[0]?.id ?? '');
     setActiveId(recovered.panels[0].id);
@@ -1420,13 +1511,20 @@ export default function Home() {
     setMessage(t(`${additions.length} strip module${additions.length === 1 ? '' : 's'} filled all remaining LED slots.`, `${additions.length} Streifenmodul${additions.length === 1 ? '' : 'e'} füllt alle freien LED-Slots.`));
   };
   const rebuildModuleSuggestions = () => {
-    const suggestions = suggestModulesFromScan(points, panels, pitch);
+    const suggestions = suggestModulesFromScan(points, panels, pitch, mapCamera);
     setModules(suggestions);
     setActiveModuleId(suggestions[0]?.id ?? '');
     setStageMode('builder');
     setSelection([]);
     setError('');
     setMessage(t(`${suggestions.length} module suggestions rebuilt from scan order, row resets and zigzag turns.`, `${suggestions.length} Modulvorschläge aus Scan-Reihenfolge, Zeilenrücksprüngen und Zickzack-Wenden neu erstellt.`));
+  };
+  const alignModulesToCurrentScanView = () => {
+    const aligned = alignModulesToScanView(modules, points, mapCamera, pitch);
+    setModules(aligned);
+    setStageMode('builder');
+    setError('');
+    setMessage(t('Module position, rotation and projected size matched to the current 3D scan view.', 'Modulposition, Rotation und projizierte Größe wurden an die aktuelle 3D-Scanansicht angepasst.'));
   };
   const redetectWiring = () => {
     if (!activeModule) return;
@@ -1646,7 +1744,7 @@ export default function Home() {
         <section className="stage-card">
           <div className="stage-toolbar">
             <div><span className="eyebrow">{stageMode === '3d' ? '3D MAP' : t('MODULAR MMFL BUILDER', 'MODULARER MMFL-BAUKASTEN')}</span><h1>{stageMode === '3d' ? fileName : activeModule?.name ?? t('No module selected', 'Kein Modul ausgewählt')}</h1></div>
-            <div className="stage-actions"><button className="swap-button" onClick={() => setStageMode(mode => mode === '3d' ? 'builder' : '3d')}>⇄ {stageMode === '3d' ? t('Open builder', 'Baukasten öffnen') : t('Show 3D scan', '3D-Scan zeigen')}</button></div>
+            <div className="stage-actions"><button className="swap-button" onClick={() => setStageMode(mode => mode === '3d' ? 'builder' : '3d')}>⇄ {stageMode === '3d' ? t('Open builder', 'Baukasten öffnen') : t('Show 3D scan', '3D-Scan zeigen')}</button>{stageMode === 'builder' && <button onClick={alignModulesToCurrentScanView}>⌁ {t('Match 3D view', 'An 3D-Ansicht anpassen')}</button>}</div>
             {stageMode === '3d' && <div className="view-switch">{[
               { id: '3D', label: '3D' }, { id: 'Top', label: t('Top', 'Oben') }, { id: 'Front', label: 'Front' }, { id: 'Side', label: t('Side', 'Seite') },
             ].map(item => <button key={item.id} className={view === item.id ? 'selected' : ''} onClick={() => selectView(item.id)}>{item.label}</button>)}</div>}
@@ -1680,6 +1778,7 @@ export default function Home() {
               <small>{unassignedCount ? t(`${unassignedCount} LED slots still need a module.`, `${unassignedCount} LED-Slots benötigen noch ein Modul.`) : t('Every physical LED slot is assigned exactly once.', 'Jeder physische LED-Slot ist genau einmal zugewiesen.')}</small>
             </div>
             <button className="auto-draft-button" onClick={rebuildModuleSuggestions}>◇ <span><strong>{t('Suggest modules from scan', 'Module aus Scan vorschlagen')}</strong><small>{t('Detect row returns, zigzag turns and likely matrix dimensions automatically.', 'Zeilenrücksprünge, Zickzack-Wenden und wahrscheinliche Matrixmaße automatisch erkennen.')}</small></span></button>
+            <button className="auto-draft-button scan-layout-button" disabled={!modules.length} onClick={alignModulesToCurrentScanView}>⌁ <span><strong>{t('Match current 3D arrangement', 'Aktuelle 3D-Anordnung übernehmen')}</strong><small>{t('Keep the modules and copy their relative position, rotation and projected size from the retained 3D camera.', 'Module beibehalten und relative Position, Rotation sowie projizierte Größe aus der gespeicherten 3D-Kamera übernehmen.')}</small></span></button>
             <div className="free-ranges"><span>{t('Free contiguous ranges', 'Freie zusammenhängende Bereiche')}</span><div>{freeRanges.length ? freeRanges.map(range => <button key={range.first} onClick={() => { setSelection([range.first]); setStageMode('3d'); }}>{`#${range.first + 1}–${range.last + 1}`} <b>{range.last - range.first + 1}</b></button>) : <em>{t('none', 'keine')}</em>}</div></div>
             <div className="module-create">
               <div className="kind-tabs">{([
@@ -1762,7 +1861,7 @@ export default function Home() {
         <div className="help-row"><b>Import</b><p>{t('Pixelblaze JSON, Marimapper 3D CSV ', 'Pixelblaze-JSON sowie Marimapper-3D-CSV ')}(<code>index,x,y,z,xn,yn,zn,error</code>) {t('and 2D CSV ', 'und 2D-CSV ')}(<code>index,u,v</code>). {t('For CSV files, the app asks for the expected LED count. Only internal gaps are automatic; extra trailing LEDs require an explicitly larger count. Missing entries are positioned from locally detected zigzag rows, allowing multiple matrix sizes in one scan, then marked as inferred and included in export.', 'Bei CSV-Dateien fragt die App nach der erwarteten LED-Anzahl. Nur interne Lücken werden automatisch ergänzt; zusätzliche Endpixel erfordern eine ausdrücklich größere Anzahl. Fehlende Einträge werden aus lokal erkannten Zickzack-Zeilen positioniert, sodass mehrere Matrixgrößen in einem Scan möglich sind; anschließend werden sie als berechnet markiert und exportiert.')}</p></div>
         <div className="help-row"><b>SVG 6.1</b><p>{t('Use File → Import Fixtures. Each LED becomes its own fixture with current ', 'Für File → Import Fixtures. Jede LED wird als eigenes Fixture mit aktuellen ')}<code>universe</code>, <code>channel</code> {t('and', 'und')} <code>fixture_definition</code> {t('attributes.', 'Attributen angelegt.')}</p></div>
         <div className="help-row"><b>CSV</b><p>{t('A robust table alternative for fixture instances, semicolon-delimited and grouped by panel path.', 'Robuste Tabellenalternative für Fixture-Instanzen. Semikolon-getrennt und mit Gruppenpfaden pro Panel.')}</p></div>
-        <div className="help-row"><b>{t('Builder', 'Baukasten')}</b><p>{t('Assign every imported LED exactly once to a matrix, strip or single-pixel module. Only module sizes that fit a remaining contiguous free range can be added. Drag modules in the 2D builder, then fine-tune X, Y, width, height and rotation.', 'Ordne jede importierte LED genau einmal einem Matrix-, Streifen- oder Einzelpixel-Modul zu. Hinzufügen lassen sich nur Modulgrößen, die in einen verbleibenden zusammenhängenden freien Bereich passen. Module im 2D-Baukasten ziehen und anschließend X, Y, Breite, Höhe und Rotation fein einstellen.')}</p></div>
+        <div className="help-row"><b>{t('Builder', 'Baukasten')}</b><p>{t('Assign every imported LED exactly once to a matrix, strip or single-pixel module. Automatic suggestions copy the relative position, projected orientation and size from the retained 3D camera. Rotate the 3D view and use Match current 3D arrangement whenever you want a different projection; then fine-tune individual modules.', 'Ordne jede importierte LED genau einmal einem Matrix-, Streifen- oder Einzelpixel-Modul zu. Automatische Vorschläge übernehmen relative Position, projizierte Ausrichtung und Größe aus der gespeicherten 3D-Kamera. Drehe die 3D-Ansicht und nutze Aktuelle 3D-Anordnung übernehmen, wenn du eine andere Projektion möchtest; anschließend kannst du einzelne Module fein einstellen.')}</p></div>
         <div className="help-row"><b>MMFL</b><p>{t('For import in the Fixture Editor. The product name comes from Fixture Definition. A physically present but unused LED is stored as an empty grid cell; later LED addresses still derive from their original source indices, so the unused LED continues to reserve its wiring/DMX position.', 'Für den Import im Fixture Editor. Der Produktname stammt aus Fixture Definition. Eine physisch vorhandene, aber unbenutzte LED wird als leere Rasterzelle gespeichert; spätere LED-Adressen werden weiterhin aus ihren ursprünglichen Quellindizes berechnet, sodass die unbenutzte LED ihre Verdrahtungs-/DMX-Position reserviert.')}</p></div>
         <div className="help-warning">{t('Legacy MadMapper 5 SVG attributes are intentionally omitted. The export follows the current 6.1 documentation.', 'Alte MadMapper-5-SVG-Attribute werden bewusst nicht verwendet. Der Export folgt der aktuellen 6.1-Dokumentation.')}</div>
       </section></div>}
