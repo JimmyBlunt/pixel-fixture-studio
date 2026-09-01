@@ -28,6 +28,7 @@ type PixelModule = {
   height: number;
   rotation: number;
   sourceCells?: ModuleSourceCell[];
+  sourceStep?: number;
   hiddenIndices: number[];
   color: string;
 };
@@ -499,7 +500,7 @@ function alignModulesToScanView(modules: PixelModule[], points: MapPoint[], came
  * four-times-angle averaging makes horizontal and vertical strip travel reinforce each other,
  * so crossed paths share one stable output grid instead of competing for a single zigzag model.
  */
-function quantizePanelScanGrid(panel: Panel, points: MapPoint[], pitch: number) {
+function quantizePanelScanGrid(panel: Panel, points: MapPoint[], pitch: number, strandRanges: { first: number; last: number }[]) {
   const projected = projectPanel(panel, points);
   const byIndex = new Map(projected.map(point => [point.sourceIndex, point]));
   let cosine = 0, sine = 0, support = 0;
@@ -516,36 +517,88 @@ function quantizePanelScanGrid(panel: Panel, points: MapPoint[], pitch: number) 
   }
   const angle = support ? Math.atan2(sine, cosine) / 4 : 0;
   const c = Math.cos(angle), s = Math.sin(angle);
-  // A small amount of breathing room prevents two noisy scans of adjacent LEDs rounding into
-  // the same MMFL cell. Real physical gaps remain visible because coordinates are not compacted.
-  const gridPitch = Math.max(pitch * .95, .0001);
+  const strandPitches = strandRanges.map(range => {
+    const distances = Array.from({ length: Math.max(0, range.last - range.first) }, (_, offset) => range.first + offset).flatMap(index => {
+      const first = points[index], next = points[index + 1];
+      return first && next && first.status === 'ok' && next.status === 'ok' ? [dist(first.xyz, next.xyz)] : [];
+    });
+    return { ...range, pitch: median(distances) };
+  });
+  const basePitch = Math.max(Math.min(...strandPitches.map(strand => strand.pitch), pitch), .0001);
+  // Use half of the densest physical pitch as the MMFL sub-grid. This leaves room to separate
+  // two crossing strands without changing an individual LED interval.
+  const cellPitch = basePitch / 2;
   const raw = projected.map(point => ({
     sourceIndex: point.sourceIndex,
-    column: (point.u * c + point.v * s) / gridPitch,
-    row: (-point.u * s + point.v * c) / gridPitch,
+    column: (point.u * c + point.v * s) / cellPitch,
+    row: (-point.u * s + point.v * c) / cellPitch,
   }));
   const minColumn = Math.min(...raw.map(cell => cell.column)), minRow = Math.min(...raw.map(cell => cell.row));
-  const occupied = new Set<string>(), cells = new Map<number, ModuleSourceCell>();
-  raw.sort((a, b) => a.sourceIndex - b.sourceIndex).forEach(cell => {
-    const targetColumn = cell.column - minColumn, targetRow = cell.row - minRow;
-    let column = Math.round(targetColumn), row = Math.round(targetRow);
-    if (occupied.has(`${column}:${row}`)) {
-      let best: { column: number; row: number; score: number } | null = null;
-      for (let radius = 1; radius <= 8 && !best; radius++) {
-        for (let dy = -radius; dy <= radius; dy++) for (let dx = -radius; dx <= radius; dx++) {
-          if (Math.max(Math.abs(dx), Math.abs(dy)) !== radius) continue;
-          const candidateColumn = column + dx, candidateRow = row + dy;
-          if (occupied.has(`${candidateColumn}:${candidateRow}`)) continue;
-          const score = (candidateColumn - targetColumn) ** 2 + (candidateRow - targetRow) ** 2;
-          if (!best || score < best.score) best = { column: candidateColumn, row: candidateRow, score };
-        }
+  const rawByIndex = new Map(raw.map(cell => [cell.sourceIndex, { ...cell, column: cell.column - minColumn, row: cell.row - minRow }]));
+  const occupied = new Set<string>(), cells = new Map<number, ModuleSourceCell>(), steps = new Map<number, number>();
+  strandPitches.forEach(strand => {
+    const relativeStep = Math.max(1, Math.round(strand.pitch / basePitch));
+    const step = relativeStep * 2;
+    steps.set(strand.first, relativeStep);
+    const strandCells = Array.from({ length: strand.last - strand.first + 1 }, (_, offset) => rawByIndex.get(strand.first + offset)).filter(Boolean) as { sourceIndex: number; row: number; column: number }[];
+    const lineRuns: typeof strandCells[] = [];
+    let lineStart = 0;
+    let lineAxis: 'horizontal' | 'vertical' | null = null, lineDirection = 0;
+    for (let offset = 0; offset < strandCells.length - 1; offset++) {
+      const first = strandCells[offset], next = strandCells[offset + 1];
+      const dc = next.column - first.column, dr = next.row - first.row;
+      const major = Math.max(Math.abs(dc), Math.abs(dr)), minor = Math.min(Math.abs(dc), Math.abs(dr));
+      const physicalDistance = dist(points[first.sourceIndex].xyz, points[next.sourceIndex].xyz);
+      const nextAxis = Math.abs(dc) >= Math.abs(dr) ? 'horizontal' : 'vertical';
+      const nextDirection = (nextAxis === 'horizontal' ? dc : dr) >= 0 ? 1 : -1;
+      const axisAligned = major > 0 && minor <= major * .65 && physicalDistance <= strand.pitch * 2.4;
+      const changesDirection = lineAxis !== null && (lineAxis !== nextAxis || lineDirection !== nextDirection);
+      if (!axisAligned || changesDirection) {
+        lineRuns.push(strandCells.slice(lineStart, offset + 1));
+        lineStart = offset + 1;
+        lineAxis = null;
+        lineDirection = 0;
+      } else if (lineAxis === null) {
+        lineAxis = nextAxis;
+        lineDirection = nextDirection;
       }
-      if (best) ({ column, row } = best);
     }
-    occupied.add(`${column}:${row}`);
-    cells.set(cell.sourceIndex, { sourceIndex: cell.sourceIndex, row, column });
+    lineRuns.push(strandCells.slice(lineStart));
+
+    lineRuns.filter(line => line.length).forEach(line => {
+      const columnSpan = Math.abs(line.at(-1)!.column - line[0].column), rowSpan = Math.abs(line.at(-1)!.row - line[0].row);
+      const horizontal = columnSpan >= rowSpan;
+      const firstMajor = horizontal ? line[0].column : line[0].row;
+      const lastMajor = horizontal ? line.at(-1)!.column : line.at(-1)!.row;
+      const direction = lastMajor >= firstMajor ? 1 : -1;
+      const majorOrigin = Math.round(median(line.map((cell, offset) => (horizontal ? cell.column : cell.row) - direction * offset * step)));
+      const minorOrigin = Math.round(median(line.map(cell => horizontal ? cell.row : cell.column)));
+      const ideal = line.map((cell, offset) => ({
+        sourceIndex: cell.sourceIndex,
+        column: horizontal ? majorOrigin + direction * offset * step : minorOrigin,
+        row: horizontal ? minorOrigin : majorOrigin + direction * offset * step,
+      }));
+
+      // Preserve spacing by moving a complete straight run when it would share a cell with an
+      // already placed run. Never push just one LED aside and create a new hole in the strip.
+      let translation = { column: 0, row: 0 };
+      const candidates: { column: number; row: number; score: number }[] = [];
+      for (let radius = 0; radius <= 32; radius++) for (let row = -radius; row <= radius; row++) for (let column = -radius; column <= radius; column++) {
+        if (Math.max(Math.abs(column), Math.abs(row)) !== radius) continue;
+        const along = horizontal ? Math.abs(column) : Math.abs(row);
+        candidates.push({ column, row, score: column ** 2 + row ** 2 + along * 4 });
+      }
+      candidates.sort((left, right) => left.score - right.score);
+      const available = candidates.find(candidate => ideal.every(cell => !occupied.has(`${cell.column + candidate.column}:${cell.row + candidate.row}`)));
+      if (available) translation = available;
+      ideal.forEach(cell => {
+        const placed = { sourceIndex: cell.sourceIndex, column: cell.column + translation.column, row: cell.row + translation.row };
+        occupied.add(`${placed.column}:${placed.row}`);
+        cells.set(placed.sourceIndex, placed);
+      });
+    });
   });
-  return cells;
+  return { cells, steps };
 }
 
 /**
@@ -573,7 +626,7 @@ function suggestModulesFromScan(points: MapPoint[], panels: Panel[], pitch: numb
   });
   runs.push({ first, last: points.length - 1, length: points.length - first });
 
-  type ModuleDraft = { first: number; count: number; rows: number; columns: number; zigzag: boolean; confidence: 'high' | 'medium'; sourceCells?: ModuleSourceCell[]; x?: number; y?: number };
+  type ModuleDraft = { first: number; count: number; rows: number; columns: number; zigzag: boolean; confidence: 'high' | 'medium'; sourceCells?: ModuleSourceCell[]; sourceStep?: number; x?: number; y?: number };
   const drafts: ModuleDraft[] = [];
   for (let offset = 0; offset < runs.length;) {
     const start = runs[offset];
@@ -623,16 +676,17 @@ function suggestModulesFromScan(points: MapPoint[], panels: Panel[], pitch: numb
     if (!indices.length) return;
     const first = indices[0], last = indices.at(-1)!;
     const breaks = strandBreaks.filter(index => index >= first && index < last);
-    const grid = quantizePanelScanGrid(panel, points, pitch);
+    const strandRanges = [...breaks, last].map((boundary, index) => ({ first: index ? breaks[index - 1] + 1 : first, last: boundary }));
+    const grid = quantizePanelScanGrid(panel, points, pitch, strandRanges);
     let segmentFirst = first;
     [...breaks, last].forEach((boundary, boundaryIndex) => {
       const segmentLast = boundaryIndex < breaks.length ? boundary : last;
-      const absoluteCells = Array.from({ length: segmentLast - segmentFirst + 1 }, (_, offset) => grid.get(segmentFirst + offset)).filter(Boolean) as ModuleSourceCell[];
+      const absoluteCells = Array.from({ length: segmentLast - segmentFirst + 1 }, (_, offset) => grid.cells.get(segmentFirst + offset)).filter(Boolean) as ModuleSourceCell[];
       if (absoluteCells.length) {
         const minColumn = Math.min(...absoluteCells.map(cell => cell.column)), minRow = Math.min(...absoluteCells.map(cell => cell.row));
         const sourceCells = absoluteCells.map(cell => ({ ...cell, column: cell.column - minColumn, row: cell.row - minRow }));
         const columns = Math.max(...sourceCells.map(cell => cell.column)) + 1, rows = Math.max(...sourceCells.map(cell => cell.row)) + 1;
-        specialDrafts.push({ first: segmentFirst, count: sourceCells.length, rows, columns, zigzag: true, confidence: 'high', sourceCells, x: minColumn, y: minRow });
+        specialDrafts.push({ first: segmentFirst, count: sourceCells.length, rows, columns, zigzag: true, confidence: 'high', sourceCells, sourceStep: grid.steps.get(segmentFirst), x: minColumn, y: minRow });
       }
       segmentFirst = boundary + 1;
     });
@@ -654,7 +708,7 @@ function suggestModulesFromScan(points: MapPoint[], panels: Panel[], pitch: numb
       draft.columns,
       index,
     );
-    module = draft.sourceCells ? { ...module, sourceCells: draft.sourceCells } : detectModuleWiring(module, points, panels, pitch);
+    module = draft.sourceCells ? { ...module, sourceCells: draft.sourceCells, sourceStep: draft.sourceStep } : detectModuleWiring(module, points, panels, pitch);
     module = {
       ...module,
       zigzag: draft.zigzag,
@@ -1913,12 +1967,12 @@ export default function Home() {
               {selectionStart >= 0 && <small className="selection-capacity">#{selectionStart + 1}: {selectionFreeCapacity} {t('consecutive free slots available', 'aufeinanderfolgende freie Slots verfügbar')}</small>}
               <button className="fill-free" disabled={!freeRanges.length} onClick={fillFreeAsStrips}>{t('Fill every remaining range as a strip', 'Alle restlichen Bereiche als Streifen füllen')}</button>
             </div>
-            <div className="module-list">{modules.map(module => <button className={module.id === activeModule?.id ? 'active' : ''} key={module.id} onClick={() => { setActiveModuleId(module.id); setStageMode('builder'); }}><i style={{ background: module.color }} /><span><strong>{module.name}</strong><small>#{module.startIndex + 1}–{module.startIndex + modulePixelCount(module)} · {module.sourceCells ? t(`${module.rows}×${module.columns} scan footprint`, `${module.rows}×${module.columns} Scan-Grundfläche`) : `${module.rows}×${module.columns}`}{module.hiddenIndices.length ? ` · ${module.hiddenIndices.length} ${t('hidden', 'ausgeblendet')}` : ''}</small></span></button>)}</div>
+            <div className="module-list">{modules.map(module => <button className={module.id === activeModule?.id ? 'active' : ''} key={module.id} onClick={() => { setActiveModuleId(module.id); setStageMode('builder'); }}><i style={{ background: module.color }} /><span><strong>{module.name}</strong><small>#{module.startIndex + 1}–{module.startIndex + modulePixelCount(module)} · {module.sourceCells ? t(`${module.rows}×${module.columns} scan footprint · constant spacing ×${module.sourceStep ?? 1}`, `${module.rows}×${module.columns} Scan-Grundfläche · konstanter Abstand ×${module.sourceStep ?? 1}`) : `${module.rows}×${module.columns}`}{module.hiddenIndices.length ? ` · ${module.hiddenIndices.length} ${t('hidden', 'ausgeblendet')}` : ''}</small></span></button>)}</div>
             {activeModule && <div className="module-editor">
               <div className="module-editor-title"><span>{t('Active module', 'Aktives Modul')}</span><button onClick={() => removeModule(activeModule.id)}>{t('Remove', 'Entfernen')}</button></div>
               <label>{t('Name', 'Name')}<input value={activeModule.name} onChange={event => updateModule({ ...activeModule, name: event.target.value })} /></label>
               <div className="module-meta"><span>{t('Assigned range', 'Zugewiesener Bereich')} <b>#{activeModule.startIndex + 1}–{activeModule.startIndex + modulePixelCount(activeModule)}</b></span><span>{activeModule.sourceCells ? t('measured scan path', 'gemessener Scan-Pfad') : activeModule.wiringDetected ? t('scan-assisted', 'scan-unterstützt') : t('manual wiring', 'manuelle Verdrahtung')}</span></div>
-              {activeModule.sourceCells ? <p className="single-note">{t('This strand keeps every measured LED position, including crossings, direction changes and intentionally empty grid cells.', 'Dieser Strang behält jede gemessene LED-Position bei – einschließlich Kreuzungen, Richtungswechseln und absichtlich leeren Rasterzellen.')}</p> : <>
+              {activeModule.sourceCells ? <p className="single-note">{t(`This strand uses a constant relative LED spacing of ×${activeModule.sourceStep ?? 1}. Whole straight runs are regularized together, while crossings, direction changes and intentional gaps between runs remain intact.`, `Dieser Strang verwendet einen konstanten relativen LED-Abstand von ×${activeModule.sourceStep ?? 1}. Ganze gerade Teilstrecken werden gemeinsam begradigt; Kreuzungen, Richtungswechsel und beabsichtigte Abstände zwischen Teilstrecken bleiben erhalten.`)}</p> : <>
                 <div className="module-grid-fields"><label>{t('Flow', 'Verlauf')}<select value={activeModule.order} onChange={event => updateModule({ ...activeModule, order: event.target.value as ModuleOrder, wiringDetected: false })}><option value="rows">{t('Rows first', 'Zeilen zuerst')}</option><option value="columns">{t('Columns first', 'Spalten zuerst')}</option></select></label><label>{t('Start corner', 'Startecke')}<select value={activeModule.startCorner} onChange={event => updateModule({ ...activeModule, startCorner: event.target.value as ModuleCorner, wiringDetected: false })}><option value="tl">↖ TL</option><option value="tr">↗ TR</option><option value="bl">↙ BL</option><option value="br">↘ BR</option></select></label></div>
                 <label className="check-row"><input type="checkbox" checked={activeModule.zigzag} onChange={event => updateModule({ ...activeModule, zigzag: event.target.checked, wiringDetected: false })} /> {t('Zigzag / serpentine wiring', 'Zickzack-/Serpentinen-Verdrahtung')}</label>
                 <button className="detect-wiring" onClick={redetectWiring}>◇ {t('Detect wiring from scan', 'Verdrahtung aus Scan erkennen')}</button>
