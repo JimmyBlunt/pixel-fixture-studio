@@ -7,9 +7,10 @@ type Language = 'en' | 'de';
 type MapPoint = { sourceIndex: number; xyz: Vec3; status: 'ok' | 'inferred' | 'manual' | 'placeholder' | 'outlier' };
 type PanelTransform = { rotation: number; scale: number; flipX: boolean; flipY: boolean };
 type Panel = { id: string; name: string; indices: number[]; color: string; enabled: boolean; transform: PanelTransform };
-type PixelModuleKind = 'matrix' | 'strip' | 'single';
+type PixelModuleKind = 'matrix' | 'strip' | 'single' | 'scan';
 type ModuleOrder = 'rows' | 'columns';
 type ModuleCorner = 'tl' | 'tr' | 'bl' | 'br';
+type ModuleSourceCell = { sourceIndex: number; row: number; column: number };
 type PixelModule = {
   id: string;
   name: string;
@@ -26,6 +27,7 @@ type PixelModule = {
   width: number;
   height: number;
   rotation: number;
+  sourceCells?: ModuleSourceCell[];
   hiddenIndices: number[];
   color: string;
 };
@@ -243,10 +245,11 @@ function modulo(value: number, divisor: number) {
 }
 
 function modulePixelCount(module: PixelModule) {
-  return Math.max(1, module.rows) * Math.max(1, module.columns);
+  return module.sourceCells?.length ?? Math.max(1, module.rows) * Math.max(1, module.columns);
 }
 
 function moduleIndices(module: PixelModule) {
+  if (module.sourceCells) return module.sourceCells.map(cell => cell.sourceIndex);
   return Array.from({ length: modulePixelCount(module) }, (_, offset) => module.startIndex + offset);
 }
 
@@ -290,15 +293,21 @@ function moduleLocalCell(module: PixelModule, offset: number) {
   return { row, column };
 }
 
+function moduleCellForSource(module: PixelModule, sourceIndex: number) {
+  return module.sourceCells?.find(cell => cell.sourceIndex === sourceIndex) ?? moduleLocalCell(module, sourceIndex - module.startIndex);
+}
+
 function moduleCells(module: PixelModule, channels: number): ModuleCell[] {
-  const count = modulePixelCount(module), hidden = new Set(module.hiddenIndices);
+  const hidden = new Set(module.hiddenIndices);
   const radians = module.rotation * Math.PI / 180, c = Math.cos(radians), s = Math.sin(radians);
-  return Array.from({ length: count }, (_, offset) => {
-    const { row, column } = moduleLocalCell(module, offset);
+  const assignments = module.sourceCells ?? Array.from({ length: modulePixelCount(module) }, (_, offset) => ({
+    sourceIndex: module.startIndex + offset,
+    ...moduleLocalCell(module, offset),
+  }));
+  return assignments.map(({ sourceIndex, row, column }) => {
     const localX = module.columns <= 1 ? module.width / 2 : column / (module.columns - 1) * module.width;
     const localY = module.rows <= 1 ? module.height / 2 : row / (module.rows - 1) * module.height;
     const dx = localX - module.width / 2, dy = localY - module.height / 2;
-    const sourceIndex = module.startIndex + offset;
     return {
       moduleId: module.id,
       sourceIndex,
@@ -332,8 +341,8 @@ function moduleGrid(modules: PixelModule[], channels: number) {
 }
 
 function makeModule(name: string, kind: PixelModuleKind, startIndex: number, rows: number, columns: number, position: number): PixelModule {
-  const safeRows = kind === 'matrix' ? Math.max(1, rows) : 1;
-  const safeColumns = kind === 'matrix' ? Math.max(1, columns) : kind === 'strip' ? Math.max(1, columns) : 1;
+  const safeRows = kind === 'matrix' || kind === 'scan' ? Math.max(1, rows) : 1;
+  const safeColumns = kind === 'matrix' || kind === 'scan' ? Math.max(1, columns) : kind === 'strip' ? Math.max(1, columns) : 1;
   return {
     id: `module-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
     name,
@@ -356,6 +365,7 @@ function makeModule(name: string, kind: PixelModuleKind, startIndex: number, row
 }
 
 function detectModuleWiring(module: PixelModule, points: MapPoint[], panels: Panel[], pitch: number): PixelModule {
+  if (module.sourceCells) return { ...module, wiringDetected: true };
   const indices = moduleIndices(module).filter(index => points[index]);
   if (indices.length < 2) return { ...module, wiringDetected: false };
   const owner = panels.find(panel => indices.some(index => panel.indices.includes(index)));
@@ -403,10 +413,13 @@ function alignModulesToScanView(modules: PixelModule[], points: MapPoint[], came
   const projected = projectScanToCamera(points, camera);
   const safePitch = Math.max(pitch, .0001);
   const aligned = modules.map(module => {
+    // Crossed strands from one panel already share an exact scan-derived lattice. Aligning each
+    // strand independently to the camera would destroy that shared basis and create collisions.
+    if (module.sourceCells) return module;
     const cellPoints = moduleIndices(module).flatMap(sourceIndex => {
       const position = projected.get(sourceIndex);
       if (!position) return [];
-      const local = moduleLocalCell(module, sourceIndex - module.startIndex);
+      const local = moduleCellForSource(module, sourceIndex);
       return [{ sourceIndex, row: local.row, column: local.column, ...position }];
     });
     if (!cellPoints.length) return module;
@@ -454,6 +467,11 @@ function alignModulesToScanView(modules: PixelModule[], points: MapPoint[], came
     });
     let moved = false;
     for (let left = 0; left < separated.length; left++) for (let right = left + 1; right < separated.length; right++) {
+      // Scan-path modules may be interwoven on the same physical panel. Their bounding boxes
+      // overlap by design, so only separate modules when their actual rounded MMFL cells collide.
+      const leftKeys = new Set(moduleCells(separated[left], 3).map(cell => `${Math.round(cell.x)}:${Math.round(cell.y)}`));
+      const hasCellCollision = moduleCells(separated[right], 3).some(cell => leftKeys.has(`${Math.round(cell.x)}:${Math.round(cell.y)}`));
+      if (!hasCellCollision) continue;
       const overlapX = Math.min(bounds[left].maxX, bounds[right].maxX) - Math.max(bounds[left].minX, bounds[right].minX) + 2;
       const overlapY = Math.min(bounds[left].maxY, bounds[right].maxY) - Math.max(bounds[left].minY, bounds[right].minY) + 2;
       if (overlapX <= 0 || overlapY <= 0) continue;
@@ -474,6 +492,60 @@ function alignModulesToScanView(modules: PixelModule[], points: MapPoint[], came
   if (!cells.length) return aligned;
   const offsetX = 2 - Math.min(...cells.map(cell => cell.x)), offsetY = 2 - Math.min(...cells.map(cell => cell.y));
   return separated.map(module => ({ ...module, x: module.x + offsetX, y: module.y + offsetY }));
+}
+
+/**
+ * Snap a measured panel to its dominant square-grid axes while retaining empty cells. Using
+ * four-times-angle averaging makes horizontal and vertical strip travel reinforce each other,
+ * so crossed paths share one stable output grid instead of competing for a single zigzag model.
+ */
+function quantizePanelScanGrid(panel: Panel, points: MapPoint[], pitch: number) {
+  const projected = projectPanel(panel, points);
+  const byIndex = new Map(projected.map(point => [point.sourceIndex, point]));
+  let cosine = 0, sine = 0, support = 0;
+  const ordered = [...panel.indices].sort((a, b) => a - b);
+  for (let offset = 0; offset < ordered.length - 1; offset++) {
+    const firstIndex = ordered[offset], nextIndex = ordered[offset + 1];
+    if (nextIndex !== firstIndex + 1) continue;
+    const first = byIndex.get(firstIndex), next = byIndex.get(nextIndex);
+    if (!first || !next) continue;
+    const du = next.u - first.u, dv = next.v - first.v, length = Math.hypot(du, dv);
+    if (length < pitch * .35 || length > pitch * 1.7) continue;
+    const angle = Math.atan2(dv, du);
+    cosine += Math.cos(angle * 4); sine += Math.sin(angle * 4); support++;
+  }
+  const angle = support ? Math.atan2(sine, cosine) / 4 : 0;
+  const c = Math.cos(angle), s = Math.sin(angle);
+  // A small amount of breathing room prevents two noisy scans of adjacent LEDs rounding into
+  // the same MMFL cell. Real physical gaps remain visible because coordinates are not compacted.
+  const gridPitch = Math.max(pitch * .95, .0001);
+  const raw = projected.map(point => ({
+    sourceIndex: point.sourceIndex,
+    column: (point.u * c + point.v * s) / gridPitch,
+    row: (-point.u * s + point.v * c) / gridPitch,
+  }));
+  const minColumn = Math.min(...raw.map(cell => cell.column)), minRow = Math.min(...raw.map(cell => cell.row));
+  const occupied = new Set<string>(), cells = new Map<number, ModuleSourceCell>();
+  raw.sort((a, b) => a.sourceIndex - b.sourceIndex).forEach(cell => {
+    const targetColumn = cell.column - minColumn, targetRow = cell.row - minRow;
+    let column = Math.round(targetColumn), row = Math.round(targetRow);
+    if (occupied.has(`${column}:${row}`)) {
+      let best: { column: number; row: number; score: number } | null = null;
+      for (let radius = 1; radius <= 8 && !best; radius++) {
+        for (let dy = -radius; dy <= radius; dy++) for (let dx = -radius; dx <= radius; dx++) {
+          if (Math.max(Math.abs(dx), Math.abs(dy)) !== radius) continue;
+          const candidateColumn = column + dx, candidateRow = row + dy;
+          if (occupied.has(`${candidateColumn}:${candidateRow}`)) continue;
+          const score = (candidateColumn - targetColumn) ** 2 + (candidateRow - targetRow) ** 2;
+          if (!best || score < best.score) best = { column: candidateColumn, row: candidateRow, score };
+        }
+      }
+      if (best) ({ column, row } = best);
+    }
+    occupied.add(`${column}:${row}`);
+    cells.set(cell.sourceIndex, { sourceIndex: cell.sourceIndex, row, column });
+  });
+  return cells;
 }
 
 /**
@@ -501,7 +573,8 @@ function suggestModulesFromScan(points: MapPoint[], panels: Panel[], pitch: numb
   });
   runs.push({ first, last: points.length - 1, length: points.length - first });
 
-  const drafts: { first: number; count: number; rows: number; columns: number; zigzag: boolean; confidence: 'high' | 'medium' }[] = [];
+  type ModuleDraft = { first: number; count: number; rows: number; columns: number; zigzag: boolean; confidence: 'high' | 'medium'; sourceCells?: ModuleSourceCell[]; x?: number; y?: number };
+  const drafts: ModuleDraft[] = [];
   for (let offset = 0; offset < runs.length;) {
     const start = runs[offset];
     const resetDistances: number[] = [];
@@ -532,18 +605,62 @@ function suggestModulesFromScan(points: MapPoint[], panels: Panel[], pitch: numb
     offset++;
   }
 
+  // A very long jump inside one spatially connected panel is a cable/strip change, not a row
+  // return. Replace any forced rectangular draft for that panel with one scan-path module per
+  // physical strand. This supports crossed and differently oriented zigzag strips on one panel.
+  const ownerByIndex = new Map<number, Panel>();
+  panels.forEach(panel => panel.indices.forEach(index => ownerByIndex.set(index, panel)));
+  const strandBreaks = Array.from({ length: Math.max(0, points.length - 1) }, (_, index) => index).filter(index => {
+    const current = points[index], next = points[index + 1];
+    return current?.status === 'ok' && next?.status === 'ok'
+      && ownerByIndex.get(index)?.id === ownerByIndex.get(index + 1)?.id
+      && dist(current.xyz, next.xyz) > pitch * 8;
+  });
+  const multiPathPanels = new Set(strandBreaks.map(index => ownerByIndex.get(index)?.id).filter(Boolean));
+  const specialDrafts: ModuleDraft[] = [];
+  panels.filter(panel => multiPathPanels.has(panel.id)).forEach(panel => {
+    const indices = [...panel.indices].sort((a, b) => a - b);
+    if (!indices.length) return;
+    const first = indices[0], last = indices.at(-1)!;
+    const breaks = strandBreaks.filter(index => index >= first && index < last);
+    const grid = quantizePanelScanGrid(panel, points, pitch);
+    let segmentFirst = first;
+    [...breaks, last].forEach((boundary, boundaryIndex) => {
+      const segmentLast = boundaryIndex < breaks.length ? boundary : last;
+      const absoluteCells = Array.from({ length: segmentLast - segmentFirst + 1 }, (_, offset) => grid.get(segmentFirst + offset)).filter(Boolean) as ModuleSourceCell[];
+      if (absoluteCells.length) {
+        const minColumn = Math.min(...absoluteCells.map(cell => cell.column)), minRow = Math.min(...absoluteCells.map(cell => cell.row));
+        const sourceCells = absoluteCells.map(cell => ({ ...cell, column: cell.column - minColumn, row: cell.row - minRow }));
+        const columns = Math.max(...sourceCells.map(cell => cell.column)) + 1, rows = Math.max(...sourceCells.map(cell => cell.row)) + 1;
+        specialDrafts.push({ first: segmentFirst, count: sourceCells.length, rows, columns, zigzag: true, confidence: 'high', sourceCells, x: minColumn, y: minRow });
+      }
+      segmentFirst = boundary + 1;
+    });
+  });
+  if (specialDrafts.length) {
+    const covered = new Set(specialDrafts.flatMap(draft => draft.sourceCells!.map(cell => cell.sourceIndex)));
+    const retained = drafts.filter(draft => !Array.from({ length: draft.count }, (_, offset) => draft.first + offset).some(index => covered.has(index)));
+    drafts.splice(0, drafts.length, ...retained, ...specialDrafts);
+    drafts.sort((a, b) => a.first - b.first);
+  }
+
   const suggestions = drafts.map((draft, index) => {
-    const kind: PixelModuleKind = draft.rows > 1 ? 'matrix' : draft.columns > 1 ? 'strip' : 'single';
+    const kind: PixelModuleKind = draft.sourceCells ? 'scan' : draft.rows > 1 ? 'matrix' : draft.columns > 1 ? 'strip' : 'single';
     let module = makeModule(
-      draft.rows > 1 ? `${draft.rows}×${draft.columns} ${translated('en', 'Suggested matrix', 'Vorgeschlagene Matrix')}` : `${draft.columns} LED Suggested strip`,
+      draft.sourceCells ? `${draft.count} LED Scan path ${index + 1}` : draft.rows > 1 ? `${draft.rows}×${draft.columns} Suggested matrix` : `${draft.columns} LED Suggested strip`,
       kind,
       draft.first,
       draft.rows,
       draft.columns,
       index,
     );
-    module = detectModuleWiring(module, points, panels, pitch);
-    module = { ...module, zigzag: draft.zigzag, wiringDetected: draft.confidence === 'high' || module.wiringDetected };
+    module = draft.sourceCells ? { ...module, sourceCells: draft.sourceCells } : detectModuleWiring(module, points, panels, pitch);
+    module = {
+      ...module,
+      zigzag: draft.zigzag,
+      wiringDetected: draft.confidence === 'high' || module.wiringDetected,
+      ...(draft.sourceCells ? { x: draft.x ?? 0, y: draft.y ?? 0, width: Math.max(0, draft.columns - 1), height: Math.max(0, draft.rows - 1) } : {}),
+    };
     return module;
   });
   return alignModulesToScanView(suggestions, points, camera, pitch);
@@ -1457,7 +1574,7 @@ export default function Home() {
   const updateModule = (next: PixelModule) => {
     setModules(items => items.map(item => item.id === next.id ? {
       ...next,
-      startIndex: Math.max(0, Math.min(points.length - modulePixelCount(next), Math.trunc(next.startIndex))),
+      startIndex: next.sourceCells ? next.startIndex : Math.max(0, Math.min(points.length - modulePixelCount(next), Math.trunc(next.startIndex))),
       rows: Math.max(1, Math.trunc(next.rows)),
       columns: Math.max(1, Math.trunc(next.columns)),
       width: Math.max(0, next.width),
@@ -1517,7 +1634,11 @@ export default function Home() {
     setStageMode('builder');
     setSelection([]);
     setError('');
-    setMessage(t(`${suggestions.length} module suggestions rebuilt from scan order, row resets and zigzag turns.`, `${suggestions.length} Modulvorschläge aus Scan-Reihenfolge, Zeilenrücksprüngen und Zickzack-Wenden neu erstellt.`));
+    const scanPaths = suggestions.filter(module => module.sourceCells).length;
+    setMessage(t(
+      `${suggestions.length} module suggestions rebuilt${scanPaths ? ` · ${scanPaths} crossed/multi-strip scan paths preserved` : ''}.`,
+      `${suggestions.length} Modulvorschläge neu erstellt${scanPaths ? ` · ${scanPaths} gekreuzte/mehrteilige Scan-Pfade beibehalten` : ''}.`,
+    ));
   };
   const alignModulesToCurrentScanView = () => {
     const aligned = alignModulesToScanView(modules, points, mapCamera, pitch);
@@ -1777,7 +1898,7 @@ export default function Home() {
               <div className="coverage-bar"><i style={{ width: `${points.length ? assignedCount / points.length * 100 : 0}%` }} /></div>
               <small>{unassignedCount ? t(`${unassignedCount} LED slots still need a module.`, `${unassignedCount} LED-Slots benötigen noch ein Modul.`) : t('Every physical LED slot is assigned exactly once.', 'Jeder physische LED-Slot ist genau einmal zugewiesen.')}</small>
             </div>
-            <button className="auto-draft-button" onClick={rebuildModuleSuggestions}>◇ <span><strong>{t('Suggest modules from scan', 'Module aus Scan vorschlagen')}</strong><small>{t('Detect row returns, zigzag turns and likely matrix dimensions automatically.', 'Zeilenrücksprünge, Zickzack-Wenden und wahrscheinliche Matrixmaße automatisch erkennen.')}</small></span></button>
+            <button className="auto-draft-button" onClick={rebuildModuleSuggestions}>◇ <span><strong>{t('Suggest modules from scan', 'Module aus Scan vorschlagen')}</strong><small>{t('Detect matrices and strip changes; preserve crossed or differently oriented scan paths.', 'Matrizen und Strangwechsel erkennen; gekreuzte oder unterschiedlich ausgerichtete Scan-Pfade beibehalten.')}</small></span></button>
             <button className="auto-draft-button scan-layout-button" disabled={!modules.length} onClick={alignModulesToCurrentScanView}>⌁ <span><strong>{t('Match current 3D arrangement', 'Aktuelle 3D-Anordnung übernehmen')}</strong><small>{t('Keep the modules and copy their relative position, rotation and projected size from the retained 3D camera.', 'Module beibehalten und relative Position, Rotation sowie projizierte Größe aus der gespeicherten 3D-Kamera übernehmen.')}</small></span></button>
             <div className="free-ranges"><span>{t('Free contiguous ranges', 'Freie zusammenhängende Bereiche')}</span><div>{freeRanges.length ? freeRanges.map(range => <button key={range.first} onClick={() => { setSelection([range.first]); setStageMode('3d'); }}>{`#${range.first + 1}–${range.last + 1}`} <b>{range.last - range.first + 1}</b></button>) : <em>{t('none', 'keine')}</em>}</div></div>
             <div className="module-create">
@@ -1792,14 +1913,16 @@ export default function Home() {
               {selectionStart >= 0 && <small className="selection-capacity">#{selectionStart + 1}: {selectionFreeCapacity} {t('consecutive free slots available', 'aufeinanderfolgende freie Slots verfügbar')}</small>}
               <button className="fill-free" disabled={!freeRanges.length} onClick={fillFreeAsStrips}>{t('Fill every remaining range as a strip', 'Alle restlichen Bereiche als Streifen füllen')}</button>
             </div>
-            <div className="module-list">{modules.map(module => <button className={module.id === activeModule?.id ? 'active' : ''} key={module.id} onClick={() => { setActiveModuleId(module.id); setStageMode('builder'); }}><i style={{ background: module.color }} /><span><strong>{module.name}</strong><small>#{module.startIndex + 1}–{module.startIndex + modulePixelCount(module)} · {module.rows}×{module.columns}{module.hiddenIndices.length ? ` · ${module.hiddenIndices.length} ${t('hidden', 'ausgeblendet')}` : ''}</small></span></button>)}</div>
+            <div className="module-list">{modules.map(module => <button className={module.id === activeModule?.id ? 'active' : ''} key={module.id} onClick={() => { setActiveModuleId(module.id); setStageMode('builder'); }}><i style={{ background: module.color }} /><span><strong>{module.name}</strong><small>#{module.startIndex + 1}–{module.startIndex + modulePixelCount(module)} · {module.sourceCells ? t(`${module.rows}×${module.columns} scan footprint`, `${module.rows}×${module.columns} Scan-Grundfläche`) : `${module.rows}×${module.columns}`}{module.hiddenIndices.length ? ` · ${module.hiddenIndices.length} ${t('hidden', 'ausgeblendet')}` : ''}</small></span></button>)}</div>
             {activeModule && <div className="module-editor">
               <div className="module-editor-title"><span>{t('Active module', 'Aktives Modul')}</span><button onClick={() => removeModule(activeModule.id)}>{t('Remove', 'Entfernen')}</button></div>
               <label>{t('Name', 'Name')}<input value={activeModule.name} onChange={event => updateModule({ ...activeModule, name: event.target.value })} /></label>
-              <div className="module-meta"><span>{t('Assigned range', 'Zugewiesener Bereich')} <b>#{activeModule.startIndex + 1}–{activeModule.startIndex + modulePixelCount(activeModule)}</b></span><span>{activeModule.wiringDetected ? t('scan-assisted', 'scan-unterstützt') : t('manual wiring', 'manuelle Verdrahtung')}</span></div>
-              <div className="module-grid-fields"><label>{t('Flow', 'Verlauf')}<select value={activeModule.order} onChange={event => updateModule({ ...activeModule, order: event.target.value as ModuleOrder, wiringDetected: false })}><option value="rows">{t('Rows first', 'Zeilen zuerst')}</option><option value="columns">{t('Columns first', 'Spalten zuerst')}</option></select></label><label>{t('Start corner', 'Startecke')}<select value={activeModule.startCorner} onChange={event => updateModule({ ...activeModule, startCorner: event.target.value as ModuleCorner, wiringDetected: false })}><option value="tl">↖ TL</option><option value="tr">↗ TR</option><option value="bl">↙ BL</option><option value="br">↘ BR</option></select></label></div>
-              <label className="check-row"><input type="checkbox" checked={activeModule.zigzag} onChange={event => updateModule({ ...activeModule, zigzag: event.target.checked, wiringDetected: false })} /> {t('Zigzag / serpentine wiring', 'Zickzack-/Serpentinen-Verdrahtung')}</label>
-              <button className="detect-wiring" onClick={redetectWiring}>◇ {t('Detect wiring from scan', 'Verdrahtung aus Scan erkennen')}</button>
+              <div className="module-meta"><span>{t('Assigned range', 'Zugewiesener Bereich')} <b>#{activeModule.startIndex + 1}–{activeModule.startIndex + modulePixelCount(activeModule)}</b></span><span>{activeModule.sourceCells ? t('measured scan path', 'gemessener Scan-Pfad') : activeModule.wiringDetected ? t('scan-assisted', 'scan-unterstützt') : t('manual wiring', 'manuelle Verdrahtung')}</span></div>
+              {activeModule.sourceCells ? <p className="single-note">{t('This strand keeps every measured LED position, including crossings, direction changes and intentionally empty grid cells.', 'Dieser Strang behält jede gemessene LED-Position bei – einschließlich Kreuzungen, Richtungswechseln und absichtlich leeren Rasterzellen.')}</p> : <>
+                <div className="module-grid-fields"><label>{t('Flow', 'Verlauf')}<select value={activeModule.order} onChange={event => updateModule({ ...activeModule, order: event.target.value as ModuleOrder, wiringDetected: false })}><option value="rows">{t('Rows first', 'Zeilen zuerst')}</option><option value="columns">{t('Columns first', 'Spalten zuerst')}</option></select></label><label>{t('Start corner', 'Startecke')}<select value={activeModule.startCorner} onChange={event => updateModule({ ...activeModule, startCorner: event.target.value as ModuleCorner, wiringDetected: false })}><option value="tl">↖ TL</option><option value="tr">↗ TR</option><option value="bl">↙ BL</option><option value="br">↘ BR</option></select></label></div>
+                <label className="check-row"><input type="checkbox" checked={activeModule.zigzag} onChange={event => updateModule({ ...activeModule, zigzag: event.target.checked, wiringDetected: false })} /> {t('Zigzag / serpentine wiring', 'Zickzack-/Serpentinen-Verdrahtung')}</label>
+                <button className="detect-wiring" onClick={redetectWiring}>◇ {t('Detect wiring from scan', 'Verdrahtung aus Scan erkennen')}</button>
+              </>}
               <div className="geometry-title">{t('Physical placement before MMFL grid', 'Physische Platzierung vor dem MMFL-Raster')}</div>
               <div className="geometry-grid">{([
                 ['X', 'x', .1], ['Y', 'y', .1], [t('Width', 'Breite'), 'width', .1], [t('Height', 'Höhe'), 'height', .1], [t('Rotation', 'Rotation'), 'rotation', 1],
