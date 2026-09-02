@@ -526,9 +526,10 @@ function quantizePanelScanGrid(panel: Panel, points: MapPoint[], pitch: number, 
     return { ...range, pitch: median(distances) };
   });
   const basePitch = Math.max(Math.min(...strandPitches.map(strand => strand.pitch), pitch), .0001);
-  // Three MMFL cells per dense-strip pitch keep a visible gap even in the fitted overview.
-  // Sparser strips retain their detected relative ratio (for example 144/m -> 3, 72/m -> 6).
-  const gridSubdivisions = 3;
+  // The densest strip defines one MMFL cell: 144/m LEDs remain directly adjacent, while a
+  // half-density 72/m strip advances by two cells. Dense horizontal rows use every second row,
+  // leaving the intermediate row for the crossing strip and creating a symmetric weave.
+  const gridSubdivisions = 1;
   const cellPitch = basePitch / gridSubdivisions;
   const raw = projected.map(point => ({
     sourceIndex: point.sourceIndex,
@@ -538,6 +539,7 @@ function quantizePanelScanGrid(panel: Panel, points: MapPoint[], pitch: number, 
   const minColumn = Math.min(...raw.map(cell => cell.column)), minRow = Math.min(...raw.map(cell => cell.row));
   const rawByIndex = new Map(raw.map(cell => [cell.sourceIndex, { ...cell, column: cell.column - minColumn, row: cell.row - minRow }]));
   const occupied = new Set<string>(), cells = new Map<number, ModuleSourceCell>(), steps = new Map<number, number>();
+  let denseRowParity: number | null = null;
   strandPitches.forEach(strand => {
     const relativeStep = Math.max(1, Math.round(strand.pitch / basePitch));
     const step = relativeStep * gridSubdivisions;
@@ -567,14 +569,42 @@ function quantizePanelScanGrid(panel: Panel, points: MapPoint[], pitch: number, 
     }
     lineRuns.push(strandCells.slice(lineStart));
 
-    lineRuns.filter(line => line.length).forEach(line => {
+    // A turn measurement can appear as a one-pixel run. Fold that endpoint into the following
+    // straight row so it cannot create an artificial extra row or gap in the woven layout.
+    const regularRuns: typeof strandCells[] = [];
+    for (let index = 0; index < lineRuns.length; index++) {
+      const line = lineRuns[index];
+      if (line.length <= 2 && index + 1 < lineRuns.length) {
+        lineRuns[index + 1] = [...line, ...lineRuns[index + 1]];
+      } else if (line.length <= 2 && regularRuns.length) {
+        regularRuns[regularRuns.length - 1] = [...regularRuns.at(-1)!, ...line];
+      } else if (line.length) regularRuns.push(line);
+    }
+
+    const denseStrip = relativeStep === 1;
+    const denseRowMedians = denseStrip ? regularRuns.map(line => median(line.map(cell => cell.row))) : [];
+    const denseRowStart = denseStrip && denseRowMedians.length ? Math.round(denseRowMedians[0]) : 0;
+    const denseRowDirection = denseStrip && denseRowMedians.length > 1 && denseRowMedians.at(-1)! < denseRowMedians[0] ? -1 : 1;
+    if (denseStrip) denseRowParity = modulo(denseRowStart, 2);
+    const snapToOppositeRowParity = (rounded: number, rawValue: number) => {
+      if (denseRowParity === null || modulo(rounded, 2) !== denseRowParity) return rounded;
+      return Math.abs(rawValue - (rounded - 1)) <= Math.abs(rawValue - (rounded + 1)) ? rounded - 1 : rounded + 1;
+    };
+
+    regularRuns.forEach((line, lineIndex) => {
       const columnSpan = Math.abs(line.at(-1)!.column - line[0].column), rowSpan = Math.abs(line.at(-1)!.row - line[0].row);
-      const horizontal = columnSpan >= rowSpan;
+      const horizontal = denseStrip || columnSpan >= rowSpan;
       const firstMajor = horizontal ? line[0].column : line[0].row;
       const lastMajor = horizontal ? line.at(-1)!.column : line.at(-1)!.row;
       const direction = lastMajor >= firstMajor ? 1 : -1;
-      const majorOrigin = Math.round(median(line.map((cell, offset) => (horizontal ? cell.column : cell.row) - direction * offset * step)));
-      const minorOrigin = Math.round(median(line.map(cell => horizontal ? cell.row : cell.column)));
+      const rawMajorOrigin = median(line.map((cell, offset) => (horizontal ? cell.column : cell.row) - direction * offset * step));
+      const rawMinorOrigin = median(line.map(cell => horizontal ? cell.row : cell.column));
+      let majorOrigin = Math.round(rawMajorOrigin);
+      let minorOrigin = denseStrip ? denseRowStart + lineIndex * 2 * denseRowDirection : Math.round(rawMinorOrigin);
+      if (!denseStrip && denseRowParity !== null) {
+        if (horizontal) minorOrigin = snapToOppositeRowParity(minorOrigin, rawMinorOrigin);
+        else majorOrigin = snapToOppositeRowParity(majorOrigin, rawMajorOrigin);
+      }
       const ideal = line.map((cell, offset) => ({
         sourceIndex: cell.sourceIndex,
         column: horizontal ? majorOrigin + direction * offset * step : minorOrigin,
@@ -587,6 +617,8 @@ function quantizePanelScanGrid(panel: Panel, points: MapPoint[], pitch: number, 
       const candidates: { column: number; row: number; score: number }[] = [];
       for (let radius = 0; radius <= 32; radius++) for (let row = -radius; row <= radius; row++) for (let column = -radius; column <= radius; column++) {
         if (Math.max(Math.abs(column), Math.abs(row)) !== radius) continue;
+        // Never move a run from an even dense row onto an odd crossing row or vice versa.
+        if (row % 2 !== 0) continue;
         const along = horizontal ? Math.abs(column) : Math.abs(row);
         candidates.push({ column, row, score: column ** 2 + row ** 2 + along * 4 });
       }
@@ -1975,7 +2007,9 @@ export default function Home() {
               <div className="module-editor-title"><span>{t('Active module', 'Aktives Modul')}</span><button onClick={() => removeModule(activeModule.id)}>{t('Remove', 'Entfernen')}</button></div>
               <label>{t('Name', 'Name')}<input value={activeModule.name} onChange={event => updateModule({ ...activeModule, name: event.target.value })} /></label>
               <div className="module-meta"><span>{t('Assigned range', 'Zugewiesener Bereich')} <b>#{activeModule.startIndex + 1}–{activeModule.startIndex + modulePixelCount(activeModule)}</b></span><span>{activeModule.sourceCells ? t('measured scan path', 'gemessener Scan-Pfad') : activeModule.wiringDetected ? t('scan-assisted', 'scan-unterstützt') : t('manual wiring', 'manuelle Verdrahtung')}</span></div>
-              {activeModule.sourceCells ? <p className="single-note">{t(`This strand uses ${activeModule.sourceGridStep ?? 3} MMFL grid cells per LED interval (relative density ×${activeModule.sourceStep ?? 1}). Whole straight runs are regularized together, while crossings and direction changes remain intact.`, `Dieser Strang verwendet ${activeModule.sourceGridStep ?? 3} MMFL-Rasterzellen pro LED-Abstand (relative Dichte ×${activeModule.sourceStep ?? 1}). Ganze gerade Teilstrecken werden gemeinsam begradigt; Kreuzungen und Richtungswechsel bleiben erhalten.`)}</p> : <>
+              {activeModule.sourceCells ? <p className="single-note">{activeModule.sourceStep === 1
+                ? t('Dense-strip LEDs occupy adjacent grid cells. Horizontal rows use every second grid row, leaving exactly one symmetric intermediate row for the crossing strip.', 'Die LEDs des dichten Strangs belegen direkt benachbarte Rasterzellen. Horizontale Reihen nutzen jede zweite Rasterzeile; dazwischen bleibt genau eine symmetrische Zeile für den kreuzenden Strang.')
+                : t(`This crossing strand uses a constant interval of ${activeModule.sourceGridStep ?? 2} grid cells and is snapped to the intermediate rows of the dense strip.`, `Dieser kreuzende Strang verwendet konstant ${activeModule.sourceGridStep ?? 2} Rasterzellen Abstand und wird auf die Zwischenzeilen des dichten Strangs eingerastet.`)}</p> : <>
                 <div className="module-grid-fields"><label>{t('Flow', 'Verlauf')}<select value={activeModule.order} onChange={event => updateModule({ ...activeModule, order: event.target.value as ModuleOrder, wiringDetected: false })}><option value="rows">{t('Rows first', 'Zeilen zuerst')}</option><option value="columns">{t('Columns first', 'Spalten zuerst')}</option></select></label><label>{t('Start corner', 'Startecke')}<select value={activeModule.startCorner} onChange={event => updateModule({ ...activeModule, startCorner: event.target.value as ModuleCorner, wiringDetected: false })}><option value="tl">↖ TL</option><option value="tr">↗ TR</option><option value="bl">↙ BL</option><option value="br">↘ BR</option></select></label></div>
                 <label className="check-row"><input type="checkbox" checked={activeModule.zigzag} onChange={event => updateModule({ ...activeModule, zigzag: event.target.checked, wiringDetected: false })} /> {t('Zigzag / serpentine wiring', 'Zickzack-/Serpentinen-Verdrahtung')}</label>
                 <button className="detect-wiring" onClick={redetectWiring}>◇ {t('Detect wiring from scan', 'Verdrahtung aus Scan erkennen')}</button>
