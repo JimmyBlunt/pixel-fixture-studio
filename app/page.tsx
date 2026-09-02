@@ -703,7 +703,21 @@ function suggestModulesFromScan(points: MapPoint[], panels: Panel[], pitch: numb
       && ownerByIndex.get(index)?.id === ownerByIndex.get(index + 1)?.id
       && dist(current.xyz, next.xyz) > pitch * 8;
   });
-  const multiPathPanels = new Set(strandBreaks.map(index => ownerByIndex.get(index)?.id).filter(Boolean));
+  const hardBreakPanelIds = new Set(strandBreaks.map(index => ownerByIndex.get(index)?.id).filter(Boolean));
+  // A large jump is also the normal cable transition between separate matrix tiles. Protect a
+  // panel when the regular detector already explains most LEDs as high-confidence matrices;
+  // only poorly explained panels fall back to the crossed/free scan-path model.
+  const multiPathPanels = new Set(panels.filter(panel => {
+    if (!hardBreakPanelIds.has(panel.id)) return false;
+    const panelIndices = new Set(panel.indices), matrixCovered = new Set<number>();
+    drafts.filter(draft => draft.rows > 1 && draft.confidence === 'high').forEach(draft => {
+      for (let offset = 0; offset < draft.count; offset++) {
+        const sourceIndex = draft.first + offset;
+        if (panelIndices.has(sourceIndex)) matrixCovered.add(sourceIndex);
+      }
+    });
+    return matrixCovered.size / Math.max(panel.indices.length, 1) < .72;
+  }).map(panel => panel.id));
   const specialDrafts: ModuleDraft[] = [];
   panels.filter(panel => multiPathPanels.has(panel.id)).forEach(panel => {
     const indices = [...panel.indices].sort((a, b) => a - b);
