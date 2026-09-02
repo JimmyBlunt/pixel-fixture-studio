@@ -29,6 +29,7 @@ type PixelModule = {
   rotation: number;
   sourceCells?: ModuleSourceCell[];
   sourceStep?: number;
+  sourceGridStep?: number;
   hiddenIndices: number[];
   color: string;
 };
@@ -525,9 +526,10 @@ function quantizePanelScanGrid(panel: Panel, points: MapPoint[], pitch: number, 
     return { ...range, pitch: median(distances) };
   });
   const basePitch = Math.max(Math.min(...strandPitches.map(strand => strand.pitch), pitch), .0001);
-  // Use half of the densest physical pitch as the MMFL sub-grid. This leaves room to separate
-  // two crossing strands without changing an individual LED interval.
-  const cellPitch = basePitch / 2;
+  // Three MMFL cells per dense-strip pitch keep a visible gap even in the fitted overview.
+  // Sparser strips retain their detected relative ratio (for example 144/m -> 3, 72/m -> 6).
+  const gridSubdivisions = 3;
+  const cellPitch = basePitch / gridSubdivisions;
   const raw = projected.map(point => ({
     sourceIndex: point.sourceIndex,
     column: (point.u * c + point.v * s) / cellPitch,
@@ -538,7 +540,7 @@ function quantizePanelScanGrid(panel: Panel, points: MapPoint[], pitch: number, 
   const occupied = new Set<string>(), cells = new Map<number, ModuleSourceCell>(), steps = new Map<number, number>();
   strandPitches.forEach(strand => {
     const relativeStep = Math.max(1, Math.round(strand.pitch / basePitch));
-    const step = relativeStep * 2;
+    const step = relativeStep * gridSubdivisions;
     steps.set(strand.first, relativeStep);
     const strandCells = Array.from({ length: strand.last - strand.first + 1 }, (_, offset) => rawByIndex.get(strand.first + offset)).filter(Boolean) as { sourceIndex: number; row: number; column: number }[];
     const lineRuns: typeof strandCells[] = [];
@@ -598,7 +600,7 @@ function quantizePanelScanGrid(panel: Panel, points: MapPoint[], pitch: number, 
       });
     });
   });
-  return { cells, steps };
+  return { cells, steps, gridSubdivisions };
 }
 
 /**
@@ -626,7 +628,7 @@ function suggestModulesFromScan(points: MapPoint[], panels: Panel[], pitch: numb
   });
   runs.push({ first, last: points.length - 1, length: points.length - first });
 
-  type ModuleDraft = { first: number; count: number; rows: number; columns: number; zigzag: boolean; confidence: 'high' | 'medium'; sourceCells?: ModuleSourceCell[]; sourceStep?: number; x?: number; y?: number };
+  type ModuleDraft = { first: number; count: number; rows: number; columns: number; zigzag: boolean; confidence: 'high' | 'medium'; sourceCells?: ModuleSourceCell[]; sourceStep?: number; sourceGridStep?: number; x?: number; y?: number };
   const drafts: ModuleDraft[] = [];
   for (let offset = 0; offset < runs.length;) {
     const start = runs[offset];
@@ -686,7 +688,8 @@ function suggestModulesFromScan(points: MapPoint[], panels: Panel[], pitch: numb
         const minColumn = Math.min(...absoluteCells.map(cell => cell.column)), minRow = Math.min(...absoluteCells.map(cell => cell.row));
         const sourceCells = absoluteCells.map(cell => ({ ...cell, column: cell.column - minColumn, row: cell.row - minRow }));
         const columns = Math.max(...sourceCells.map(cell => cell.column)) + 1, rows = Math.max(...sourceCells.map(cell => cell.row)) + 1;
-        specialDrafts.push({ first: segmentFirst, count: sourceCells.length, rows, columns, zigzag: true, confidence: 'high', sourceCells, sourceStep: grid.steps.get(segmentFirst), x: minColumn, y: minRow });
+        const sourceStep = grid.steps.get(segmentFirst) ?? 1;
+        specialDrafts.push({ first: segmentFirst, count: sourceCells.length, rows, columns, zigzag: true, confidence: 'high', sourceCells, sourceStep, sourceGridStep: sourceStep * grid.gridSubdivisions, x: minColumn, y: minRow });
       }
       segmentFirst = boundary + 1;
     });
@@ -708,7 +711,7 @@ function suggestModulesFromScan(points: MapPoint[], panels: Panel[], pitch: numb
       draft.columns,
       index,
     );
-    module = draft.sourceCells ? { ...module, sourceCells: draft.sourceCells, sourceStep: draft.sourceStep } : detectModuleWiring(module, points, panels, pitch);
+    module = draft.sourceCells ? { ...module, sourceCells: draft.sourceCells, sourceStep: draft.sourceStep, sourceGridStep: draft.sourceGridStep } : detectModuleWiring(module, points, panels, pitch);
     module = {
       ...module,
       zigzag: draft.zigzag,
@@ -1967,12 +1970,12 @@ export default function Home() {
               {selectionStart >= 0 && <small className="selection-capacity">#{selectionStart + 1}: {selectionFreeCapacity} {t('consecutive free slots available', 'aufeinanderfolgende freie Slots verfügbar')}</small>}
               <button className="fill-free" disabled={!freeRanges.length} onClick={fillFreeAsStrips}>{t('Fill every remaining range as a strip', 'Alle restlichen Bereiche als Streifen füllen')}</button>
             </div>
-            <div className="module-list">{modules.map(module => <button className={module.id === activeModule?.id ? 'active' : ''} key={module.id} onClick={() => { setActiveModuleId(module.id); setStageMode('builder'); }}><i style={{ background: module.color }} /><span><strong>{module.name}</strong><small>#{module.startIndex + 1}–{module.startIndex + modulePixelCount(module)} · {module.sourceCells ? t(`${module.rows}×${module.columns} scan footprint · constant spacing ×${module.sourceStep ?? 1}`, `${module.rows}×${module.columns} Scan-Grundfläche · konstanter Abstand ×${module.sourceStep ?? 1}`) : `${module.rows}×${module.columns}`}{module.hiddenIndices.length ? ` · ${module.hiddenIndices.length} ${t('hidden', 'ausgeblendet')}` : ''}</small></span></button>)}</div>
+            <div className="module-list">{modules.map(module => <button className={module.id === activeModule?.id ? 'active' : ''} key={module.id} onClick={() => { setActiveModuleId(module.id); setStageMode('builder'); }}><i style={{ background: module.color }} /><span><strong>{module.name}</strong><small>#{module.startIndex + 1}–{module.startIndex + modulePixelCount(module)} · {module.sourceCells ? t(`${module.rows}×${module.columns} scan footprint · spacing ${module.sourceGridStep ?? 3} grid cells (relative ×${module.sourceStep ?? 1})`, `${module.rows}×${module.columns} Scan-Grundfläche · Abstand ${module.sourceGridStep ?? 3} Rasterzellen (relativ ×${module.sourceStep ?? 1})`) : `${module.rows}×${module.columns}`}{module.hiddenIndices.length ? ` · ${module.hiddenIndices.length} ${t('hidden', 'ausgeblendet')}` : ''}</small></span></button>)}</div>
             {activeModule && <div className="module-editor">
               <div className="module-editor-title"><span>{t('Active module', 'Aktives Modul')}</span><button onClick={() => removeModule(activeModule.id)}>{t('Remove', 'Entfernen')}</button></div>
               <label>{t('Name', 'Name')}<input value={activeModule.name} onChange={event => updateModule({ ...activeModule, name: event.target.value })} /></label>
               <div className="module-meta"><span>{t('Assigned range', 'Zugewiesener Bereich')} <b>#{activeModule.startIndex + 1}–{activeModule.startIndex + modulePixelCount(activeModule)}</b></span><span>{activeModule.sourceCells ? t('measured scan path', 'gemessener Scan-Pfad') : activeModule.wiringDetected ? t('scan-assisted', 'scan-unterstützt') : t('manual wiring', 'manuelle Verdrahtung')}</span></div>
-              {activeModule.sourceCells ? <p className="single-note">{t(`This strand uses a constant relative LED spacing of ×${activeModule.sourceStep ?? 1}. Whole straight runs are regularized together, while crossings, direction changes and intentional gaps between runs remain intact.`, `Dieser Strang verwendet einen konstanten relativen LED-Abstand von ×${activeModule.sourceStep ?? 1}. Ganze gerade Teilstrecken werden gemeinsam begradigt; Kreuzungen, Richtungswechsel und beabsichtigte Abstände zwischen Teilstrecken bleiben erhalten.`)}</p> : <>
+              {activeModule.sourceCells ? <p className="single-note">{t(`This strand uses ${activeModule.sourceGridStep ?? 3} MMFL grid cells per LED interval (relative density ×${activeModule.sourceStep ?? 1}). Whole straight runs are regularized together, while crossings and direction changes remain intact.`, `Dieser Strang verwendet ${activeModule.sourceGridStep ?? 3} MMFL-Rasterzellen pro LED-Abstand (relative Dichte ×${activeModule.sourceStep ?? 1}). Ganze gerade Teilstrecken werden gemeinsam begradigt; Kreuzungen und Richtungswechsel bleiben erhalten.`)}</p> : <>
                 <div className="module-grid-fields"><label>{t('Flow', 'Verlauf')}<select value={activeModule.order} onChange={event => updateModule({ ...activeModule, order: event.target.value as ModuleOrder, wiringDetected: false })}><option value="rows">{t('Rows first', 'Zeilen zuerst')}</option><option value="columns">{t('Columns first', 'Spalten zuerst')}</option></select></label><label>{t('Start corner', 'Startecke')}<select value={activeModule.startCorner} onChange={event => updateModule({ ...activeModule, startCorner: event.target.value as ModuleCorner, wiringDetected: false })}><option value="tl">↖ TL</option><option value="tr">↗ TR</option><option value="bl">↙ BL</option><option value="br">↘ BR</option></select></label></div>
                 <label className="check-row"><input type="checkbox" checked={activeModule.zigzag} onChange={event => updateModule({ ...activeModule, zigzag: event.target.checked, wiringDetected: false })} /> {t('Zigzag / serpentine wiring', 'Zickzack-/Serpentinen-Verdrahtung')}</label>
                 <button className="detect-wiring" onClick={redetectWiring}>◇ {t('Detect wiring from scan', 'Verdrahtung aus Scan erkennen')}</button>
