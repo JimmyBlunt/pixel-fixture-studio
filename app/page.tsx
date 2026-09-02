@@ -408,8 +408,9 @@ function averageVector(vectors: { u: number; v: number }[]) {
 }
 
 /**
- * Preserve the relative arrangement visible in the 3D camera when constructing the editable
- * orthogonal MMFL modules. Each module gets a scan-derived centre, rotation and projected size.
+ * Preserve the relative arrangement visible in the 3D camera while converting regular modules
+ * to an orthogonal MMFL grid. Camera perspective is useful for ordering and orientation, but it
+ * must not stretch a square matrix or leave it at an arbitrary angle in the output fixture.
  */
 function alignModulesToScanView(modules: PixelModule[], points: MapPoint[], camera: Camera, pitch: number) {
   const projected = projectScanToCamera(points, camera);
@@ -434,25 +435,27 @@ function alignModulesToScanView(modules: PixelModule[], points: MapPoint[], came
       if (below) vertical.push({ u: below.u - point.u, v: below.v - point.v });
     });
     const columnVector = averageVector(horizontal), rowVector = averageVector(vertical);
-    const columnStep = columnVector ? Math.hypot(columnVector.u, columnVector.v) / safePitch : 1;
-    const rowStep = rowVector ? Math.hypot(rowVector.u, rowVector.v) / safePitch : 1;
-    // Never compress below one MMFL cell per physical step: perspective may make a panel
-    // appear edge-on, but its output grid must still keep every LED in a unique cell.
-    const width = module.columns > 1 ? Math.max(1, columnStep) * (module.columns - 1) : 0;
-    const height = module.rows > 1 ? Math.max(1, rowStep) * (module.rows - 1) : 0;
+    // A detected matrix already tells us its exact logical cell dimensions. Using projected
+    // camera distances here previously enlarged edge-on matrices and compressed front-facing
+    // ones, which produced irregular spacing and dozens of rounded-cell collisions.
+    const width = Math.max(module.columns - 1, 0);
+    const height = Math.max(module.rows - 1, 0);
     const columnSpan = columnVector ? Math.hypot(columnVector.u, columnVector.v) * Math.max(module.columns - 1, 1) : 0;
     const rowSpan = rowVector ? Math.hypot(rowVector.u, rowVector.v) * Math.max(module.rows - 1, 1) : 0;
     const direction = rowVector && rowSpan > columnSpan
       ? Math.atan2(rowVector.v, rowVector.u) - Math.PI / 2
       : columnVector ? Math.atan2(columnVector.v, columnVector.u) : rowVector ? Math.atan2(rowVector.v, rowVector.u) - Math.PI / 2 : 0;
     const center = cellPoints.reduce((sum, point) => ({ u: sum.u + point.u / cellPoints.length, v: sum.v + point.v / cellPoints.length }), { u: 0, v: 0 });
+    // MMFL is an orthogonal pixel grid. Retain whether the physical module is horizontal or
+    // vertical, while discarding camera roll/perspective such as -15.8 degrees.
+    const snappedRotation = Math.round(direction / (Math.PI / 2)) * 90;
     return {
       ...module,
       x: center.u / safePitch - width / 2,
       y: center.v / safePitch - height / 2,
       width,
       height,
-      rotation: normalizeDegrees(direction * 180 / Math.PI),
+      rotation: normalizeDegrees(snappedRotation),
     };
   });
   // A 3D camera can visually overlap panels that live at different depths. MMFL is a single
@@ -470,13 +473,15 @@ function alignModulesToScanView(modules: PixelModule[], points: MapPoint[], came
     let moved = false;
     for (let left = 0; left < separated.length; left++) for (let right = left + 1; right < separated.length; right++) {
       // Scan-path modules may be interwoven on the same physical panel. Their bounding boxes
-      // overlap by design, so only separate modules when their actual rounded MMFL cells collide.
+      // overlap by design, so only separate them when actual rounded MMFL cells collide. Normal
+      // matrices are solid rectangles and need a small bounding-box gap for an editable draft.
       const leftKeys = new Set(moduleCells(separated[left], 3).map(cell => `${Math.round(cell.x)}:${Math.round(cell.y)}`));
       const hasCellCollision = moduleCells(separated[right], 3).some(cell => leftKeys.has(`${Math.round(cell.x)}:${Math.round(cell.y)}`));
-      if (!hasCellCollision) continue;
       const overlapX = Math.min(bounds[left].maxX, bounds[right].maxX) - Math.max(bounds[left].minX, bounds[right].minX) + 2;
       const overlapY = Math.min(bounds[left].maxY, bounds[right].maxY) - Math.max(bounds[left].minY, bounds[right].minY) + 2;
       if (overlapX <= 0 || overlapY <= 0) continue;
+      const hasScanPath = Boolean(separated[left].sourceCells || separated[right].sourceCells);
+      if (hasScanPath && !hasCellCollision) continue;
       moved = true;
       if (overlapX < overlapY) {
         const leftCenter = (bounds[left].minX + bounds[left].maxX) / 2, rightCenter = (bounds[right].minX + bounds[right].maxX) / 2;
