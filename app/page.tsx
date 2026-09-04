@@ -33,7 +33,7 @@ type PixelModule = {
   hiddenIndices: number[];
   color: string;
 };
-type Camera = { yaw: number; pitch: number; zoom: number };
+type Camera = { yaw: number; pitch: number; zoom: number; roll?: number };
 type Projection = { sourceIndex: number; u: number; v: number };
 type PanelBasis = { center: Vec3; e1: Vec3; e2: Vec3 };
 type RepairSuggestion = {
@@ -187,7 +187,9 @@ function mul(m: number[][], v: Vec3): Vec3 { return [dot(m[0] as Vec3, v), dot(m
 function power(m: number[][], seed: Vec3): Vec3 { let v = norm(seed); for (let i = 0; i < 24; i++) v = norm(mul(m, v)); return v; }
 
 function getPanelBasis(panel: Panel, points: MapPoint[]): PanelBasis | null {
-  const pts = panel.indices.map(index => points[index]).filter(Boolean);
+  const all = panel.indices.map(index => points[index]).filter(point => point && point.status !== 'placeholder');
+  const measured = all.filter(point => point.status === 'ok');
+  const pts = measured.length >= 3 ? measured : all;
   if (!pts.length) return null;
   const c: Vec3 = [0, 0, 0];
   pts.forEach(p => p.xyz.forEach((n, i) => { c[i] += n / pts.length; }));
@@ -200,7 +202,7 @@ function getPanelBasis(panel: Panel, points: MapPoint[]): PanelBasis | null {
   const first = pts[0].xyz, last = pts[pts.length - 1].xyz;
   const travel: Vec3 = [last[0] - first[0], last[1] - first[1], last[2] - first[2]];
   if (dot(e1, travel) < 0) e1 = [-e1[0], -e1[1], -e1[2]];
-  if (Math.abs(dot(e1, e2)) > .15) e2 = norm([e2[0] - dot(e1, e2) * e1[0], e2[1] - dot(e1, e2) * e1[1], e2[2] - dot(e1, e2) * e1[2]]);
+  e2 = norm([e2[0] - dot(e1, e2) * e1[0], e2[1] - dot(e1, e2) * e1[1], e2[2] - dot(e1, e2) * e1[2]]);
   return { center: c, e1, e2 };
 }
 
@@ -213,6 +215,38 @@ function projectPanel(panel: Panel, points: MapPoint[]): Projection[] {
   const basis = getPanelBasis(panel, points);
   if (!basis) return [];
   return panel.indices.map(index => points[index]).filter(Boolean).map(point => ({ sourceIndex: point.sourceIndex, ...projectXyz(point.xyz, basis) }));
+}
+
+/** Fit the physical plane, then align its dominant strip directions, independent of the camera. */
+function frontalPanelBasis(panel: Panel, points: MapPoint[], pitch: number): PanelBasis | null {
+  const basis = getPanelBasis(panel, points);
+  if (!basis) return null;
+  const indices = new Set(panel.indices);
+  let cosine = 0, sine = 0;
+  panel.indices.forEach(index => {
+    const first = points[index], next = points[index + 1];
+    if (!indices.has(index + 1) || first?.status !== 'ok' || next?.status !== 'ok') return;
+    const length = dist(first.xyz, next.xyz);
+    if (length < pitch * .35 || length > pitch * 2.4) return;
+    const a = projectXyz(first.xyz, basis), b = projectXyz(next.xyz, basis);
+    const angle = Math.atan2(b.v - a.v, b.u - a.u);
+    cosine += Math.cos(4 * angle); sine += Math.sin(4 * angle);
+  });
+  const angle = Math.atan2(sine, cosine) / 4, c = Math.cos(angle), s = Math.sin(angle);
+  return { center: basis.center,
+    e1: basis.e1.map((value, axis) => value * c - basis.e2[axis] * s) as Vec3,
+    e2: basis.e2.map((value, axis) => basis.e1[axis] * s + value * c) as Vec3 };
+}
+
+function frontalPanelCamera(panel: Panel, points: MapPoint[], pitch: number, zoom = 1): Camera {
+  const basis = frontalPanelBasis(panel, points, pitch);
+  if (!basis) return { yaw: 0, pitch: 0, zoom };
+  const [a, b] = [basis.e1, basis.e2];
+  const normal = norm([a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]);
+  const yaw = Math.atan2(normal[0], normal[2]), tilt = Math.asin(Math.max(-1, Math.min(1, normal[1])));
+  const right: Vec3 = [Math.cos(yaw), 0, -Math.sin(yaw)];
+  const up: Vec3 = [-Math.sin(yaw) * Math.sin(tilt), Math.cos(tilt), -Math.cos(yaw) * Math.sin(tilt)];
+  return { yaw, pitch: tilt, roll: -Math.atan2(dot(a, up), dot(a, right)), zoom };
 }
 
 /** Apply the non-destructive 2D orientation used by every preview and export. */
@@ -398,7 +432,8 @@ function projectScanToCamera(points: MapPoint[], camera: Camera) {
   return new Map(usable.map(point => {
     const x = point.xyz[0] - center[0], y = point.xyz[1] - center[1], z = point.xyz[2] - center[2];
     const u = x * cy - z * sy, depth = x * sy + z * cy, vertical = y * cp - depth * sp;
-    return [point.sourceIndex, { u, v: -vertical }] as const;
+    const cr = Math.cos(camera.roll ?? 0), sr = Math.sin(camera.roll ?? 0);
+    return [point.sourceIndex, { u: u * cr - vertical * sr, v: -(u * sr + vertical * cr) }] as const;
   }));
 }
 
@@ -472,6 +507,7 @@ function alignModulesToScanView(modules: PixelModule[], points: MapPoint[], came
     });
     let moved = false;
     for (let left = 0; left < separated.length; left++) for (let right = left + 1; right < separated.length; right++) {
+      if (separated[left].sourceCells && separated[right].sourceCells) continue;
       // Scan-path modules may be interwoven on the same physical panel. Their bounding boxes
       // overlap by design, so only separate them when actual rounded MMFL cells collide. Normal
       // matrices are solid rectangles and need a small bounding-box gap for an editable draft.
@@ -507,22 +543,8 @@ function alignModulesToScanView(modules: PixelModule[], points: MapPoint[], came
  * so crossed paths share one stable output grid instead of competing for a single zigzag model.
  */
 function quantizePanelScanGrid(panel: Panel, points: MapPoint[], pitch: number, strandRanges: { first: number; last: number }[]) {
-  const projected = projectPanel(panel, points);
-  const byIndex = new Map(projected.map(point => [point.sourceIndex, point]));
-  let cosine = 0, sine = 0, support = 0;
-  const ordered = [...panel.indices].sort((a, b) => a - b);
-  for (let offset = 0; offset < ordered.length - 1; offset++) {
-    const firstIndex = ordered[offset], nextIndex = ordered[offset + 1];
-    if (nextIndex !== firstIndex + 1) continue;
-    const first = byIndex.get(firstIndex), next = byIndex.get(nextIndex);
-    if (!first || !next) continue;
-    const du = next.u - first.u, dv = next.v - first.v, length = Math.hypot(du, dv);
-    if (length < pitch * .35 || length > pitch * 1.7) continue;
-    const angle = Math.atan2(dv, du);
-    cosine += Math.cos(angle * 4); sine += Math.sin(angle * 4); support++;
-  }
-  const angle = support ? Math.atan2(sine, cosine) / 4 : 0;
-  const c = Math.cos(angle), s = Math.sin(angle);
+  const basis = frontalPanelBasis(panel, points, pitch);
+  const projected = basis ? panel.indices.filter(index => points[index]).map(sourceIndex => ({ sourceIndex, ...projectXyz(points[sourceIndex].xyz, basis) })) : [];
   const strandPitches = strandRanges.map(range => {
     const distances = Array.from({ length: Math.max(0, range.last - range.first) }, (_, offset) => range.first + offset).flatMap(index => {
       const first = points[index], next = points[index + 1];
@@ -531,23 +553,20 @@ function quantizePanelScanGrid(panel: Panel, points: MapPoint[], pitch: number, 
     return { ...range, pitch: median(distances) };
   });
   const basePitch = Math.max(Math.min(...strandPitches.map(strand => strand.pitch), pitch), .0001);
-  // The densest strip defines one MMFL cell: 144/m LEDs remain directly adjacent, while a
-  // half-density 72/m strip advances by two cells. Dense horizontal rows use every second row,
-  // leaving the intermediate row for the crossing strip and creating a symmetric weave.
-  const gridSubdivisions = 1;
-  const cellPitch = basePitch / gridSubdivisions;
+  // Keep every strand in the SAME physical plane. Density is a spacing measurement, not a
+  // direction or a row-number convention: a dense strip can run vertically or turn anywhere.
+  const cellPitch = basePitch;
   const raw = projected.map(point => ({
     sourceIndex: point.sourceIndex,
-    column: (point.u * c + point.v * s) / cellPitch,
-    row: (-point.u * s + point.v * c) / cellPitch,
+    column: point.u / cellPitch,
+    row: point.v / cellPitch,
   }));
   const minColumn = Math.min(...raw.map(cell => cell.column)), minRow = Math.min(...raw.map(cell => cell.row));
   const rawByIndex = new Map(raw.map(cell => [cell.sourceIndex, { ...cell, column: cell.column - minColumn, row: cell.row - minRow }]));
-  const occupied = new Set<string>(), cells = new Map<number, ModuleSourceCell>(), steps = new Map<number, number>();
-  let denseRowParity: number | null = null;
+  const fitted: ModuleSourceCell[] = [], steps = new Map<number, number>();
   strandPitches.forEach(strand => {
-    const relativeStep = Math.max(1, Math.round(strand.pitch / basePitch));
-    const step = relativeStep * gridSubdivisions;
+    const relativeStep = Math.max(1, strand.pitch / basePitch);
+    const step = relativeStep;
     steps.set(strand.first, relativeStep);
     const strandCells = Array.from({ length: strand.last - strand.first + 1 }, (_, offset) => rawByIndex.get(strand.first + offset)).filter(Boolean) as { sourceIndex: number; row: number; column: number }[];
     const lineRuns: typeof strandCells[] = [];
@@ -560,7 +579,7 @@ function quantizePanelScanGrid(panel: Panel, points: MapPoint[], pitch: number, 
       const physicalDistance = dist(points[first.sourceIndex].xyz, points[next.sourceIndex].xyz);
       const nextAxis = Math.abs(dc) >= Math.abs(dr) ? 'horizontal' : 'vertical';
       const nextDirection = (nextAxis === 'horizontal' ? dc : dr) >= 0 ? 1 : -1;
-      const axisAligned = major > 0 && minor <= major * .65 && physicalDistance <= strand.pitch * 2.4;
+      const axisAligned = major > 0 && minor <= major * .35 && physicalDistance <= strand.pitch * 2.4;
       const changesDirection = lineAxis !== null && (lineAxis !== nextAxis || lineDirection !== nextDirection);
       if (!axisAligned || changesDirection) {
         lineRuns.push(strandCells.slice(lineStart, offset + 1));
@@ -574,69 +593,49 @@ function quantizePanelScanGrid(panel: Panel, points: MapPoint[], pitch: number, 
     }
     lineRuns.push(strandCells.slice(lineStart));
 
-    // A turn measurement can appear as a one-pixel run. Fold that endpoint into the following
-    // straight row so it cannot create an artificial extra row or gap in the woven layout.
-    const regularRuns: typeof strandCells[] = [];
-    for (let index = 0; index < lineRuns.length; index++) {
-      const line = lineRuns[index];
-      if (line.length <= 2 && index + 1 < lineRuns.length) {
-        lineRuns[index + 1] = [...line, ...lineRuns[index + 1]];
-      } else if (line.length <= 2 && regularRuns.length) {
-        regularRuns[regularRuns.length - 1] = [...regularRuns.at(-1)!, ...line];
-      } else if (line.length) regularRuns.push(line);
-    }
-
-    const denseStrip = relativeStep === 1;
-    const denseRowMedians = denseStrip ? regularRuns.map(line => median(line.map(cell => cell.row))) : [];
-    const denseRowStart = denseStrip && denseRowMedians.length ? Math.round(denseRowMedians[0]) : 0;
-    const denseRowDirection = denseStrip && denseRowMedians.length > 1 && denseRowMedians.at(-1)! < denseRowMedians[0] ? -1 : 1;
-    if (denseStrip) denseRowParity = modulo(denseRowStart, 2);
-    const snapToOppositeRowParity = (rounded: number, rawValue: number) => {
-      if (denseRowParity === null || modulo(rounded, 2) !== denseRowParity) return rounded;
-      return Math.abs(rawValue - (rounded - 1)) <= Math.abs(rawValue - (rounded + 1)) ? rounded - 1 : rounded + 1;
-    };
-
-    regularRuns.forEach((line, lineIndex) => {
+    lineRuns.filter(line => line.length).forEach(line => {
+      // A short turn is not enough evidence for a new straight run. Preserve its measured
+      // position instead of merging it into another row and shifting subsequent LEDs.
+      if (line.length < 3) { fitted.push(...line); return; }
       const columnSpan = Math.abs(line.at(-1)!.column - line[0].column), rowSpan = Math.abs(line.at(-1)!.row - line[0].row);
-      const horizontal = denseStrip || columnSpan >= rowSpan;
+      const horizontal = columnSpan >= rowSpan;
       const firstMajor = horizontal ? line[0].column : line[0].row;
       const lastMajor = horizontal ? line.at(-1)!.column : line.at(-1)!.row;
       const direction = lastMajor >= firstMajor ? 1 : -1;
       const rawMajorOrigin = median(line.map((cell, offset) => (horizontal ? cell.column : cell.row) - direction * offset * step));
       const rawMinorOrigin = median(line.map(cell => horizontal ? cell.row : cell.column));
-      let majorOrigin = Math.round(rawMajorOrigin);
-      let minorOrigin = denseStrip ? denseRowStart + lineIndex * 2 * denseRowDirection : Math.round(rawMinorOrigin);
-      if (!denseStrip && denseRowParity !== null) {
-        if (horizontal) minorOrigin = snapToOppositeRowParity(minorOrigin, rawMinorOrigin);
-        else majorOrigin = snapToOppositeRowParity(majorOrigin, rawMajorOrigin);
-      }
+      const majorOrigin = rawMajorOrigin, minorOrigin = rawMinorOrigin;
       const ideal = line.map((cell, offset) => ({
         sourceIndex: cell.sourceIndex,
         column: horizontal ? majorOrigin + direction * offset * step : minorOrigin,
         row: horizontal ? minorOrigin : majorOrigin + direction * offset * step,
       }));
 
-      // Preserve spacing by moving a complete straight run when it would share a cell with an
-      // already placed run. Never push just one LED aside and create a new hole in the strip.
-      let translation = { column: 0, row: 0 };
-      const candidates: { column: number; row: number; score: number }[] = [];
-      for (let radius = 0; radius <= 32; radius++) for (let row = -radius; row <= radius; row++) for (let column = -radius; column <= radius; column++) {
-        if (Math.max(Math.abs(column), Math.abs(row)) !== radius) continue;
-        // Never move a run from an even dense row onto an odd crossing row or vice versa.
-        if (row % 2 !== 0) continue;
-        const along = horizontal ? Math.abs(column) : Math.abs(row);
-        candidates.push({ column, row, score: column ** 2 + row ** 2 + along * 4 });
-      }
-      candidates.sort((left, right) => left.score - right.score);
-      const available = candidates.find(candidate => ideal.every(cell => !occupied.has(`${cell.column + candidate.column}:${cell.row + candidate.row}`)));
-      if (available) translation = available;
-      ideal.forEach(cell => {
-        const placed = { sourceIndex: cell.sourceIndex, column: cell.column + translation.column, row: cell.row + translation.row };
-        occupied.add(`${placed.column}:${placed.row}`);
-        cells.set(placed.sourceIndex, placed);
-      });
+      // Only regularize a run when its measured points support that fit. Never reshape a
+      // diagonal or an irregular region merely because the indices are consecutive.
+      const residual = Math.max(...ideal.map((cell, index) => Math.hypot(cell.column - line[index].column, cell.row - line[index].row)));
+      fitted.push(...(residual <= step * .4 ? ideal : line));
     });
   });
+  // Refine one shared grid when rounding merges LEDs; do not translate independent runs to
+  // "solve" collisions, because that destroys the panel silhouette and relative positions.
+  let gridSubdivisions = 1;
+  let cells = new Map<number, ModuleSourceCell>();
+  for (const subdivisions of [1, 2, 4, 8, 16]) {
+    gridSubdivisions = subdivisions;
+    cells = new Map(fitted.map(cell => [cell.sourceIndex, { sourceIndex: cell.sourceIndex, column: Math.round(cell.column * subdivisions), row: Math.round(cell.row * subdivisions) }]));
+    const occupied = new Map<string, ModuleSourceCell[]>();
+    let roundingCollision = false;
+    fitted.forEach(point => {
+      const cell = cells.get(point.sourceIndex)!;
+      const key = `${cell.column}:${cell.row}`, previous = occupied.get(key) ?? [];
+      // Nearly identical measured/inferred positions are ambiguous scan data, not a reason
+      // to inflate the entire fixture. Keep these collisions visible for manual review.
+      if (previous.some(other => Math.hypot(point.column - other.column, point.row - other.row) >= .35)) roundingCollision = true;
+      occupied.set(key, [...previous, point]);
+    });
+    if (!roundingCollision) break;
+  }
   return { cells, steps, gridSubdivisions };
 }
 
@@ -739,7 +738,7 @@ function suggestModulesFromScan(points: MapPoint[], panels: Panel[], pitch: numb
         const minColumn = Math.min(...absoluteCells.map(cell => cell.column)), minRow = Math.min(...absoluteCells.map(cell => cell.row));
         const sourceCells = absoluteCells.map(cell => ({ ...cell, column: cell.column - minColumn, row: cell.row - minRow }));
         const columns = Math.max(...sourceCells.map(cell => cell.column)) + 1, rows = Math.max(...sourceCells.map(cell => cell.row)) + 1;
-        const sourceStep = grid.steps.get(segmentFirst) ?? 1;
+        const sourceStep = Math.round((grid.steps.get(segmentFirst) ?? 1) * 100) / 100;
         specialDrafts.push({ first: segmentFirst, count: sourceCells.length, rows, columns, zigzag: true, confidence: 'high', sourceCells, sourceStep, sourceGridStep: sourceStep * grid.gridSubdivisions, x: minColumn, y: minRow });
       }
       segmentFirst = boundary + 1;
@@ -771,7 +770,8 @@ function suggestModulesFromScan(points: MapPoint[], panels: Panel[], pitch: numb
     };
     return module;
   });
-  return alignModulesToScanView(suggestions, points, camera, pitch);
+  const layoutCamera = panels.length === 1 ? frontalPanelCamera(panels[0], points, pitch) : camera;
+  return alignModulesToScanView(suggestions, points, layoutCamera, pitch);
 }
 
 function buildModuleMmfl(modules: PixelModule[], total: number, settings: ExportSettings) {
@@ -1253,7 +1253,8 @@ function MapCanvas({ points, panels, selectionMode, showPixelNumbers, hiddenIndi
         const p = points[item.index].xyz, x = p[0] - center[0], y = p[1] - center[1], z = p[2] - center[2];
         const cy = Math.cos(camera.yaw), sy = Math.sin(camera.yaw), cp = Math.cos(camera.pitch), sp = Math.sin(camera.pitch);
         const x1 = x * cy - z * sy, z1 = x * sy + z * cy, y1 = y * cp - z1 * sp, z2 = y * sp + z1 * cp;
-        return { ...item, x: x1, y: y1, z: z2 };
+        const cr = Math.cos(camera.roll ?? 0), sr = Math.sin(camera.roll ?? 0);
+        return { ...item, x: x1 * cr - y1 * sr, y: x1 * sr + y1 * cr, z: z2 };
       });
       const span = Math.max(...rotated.map(p => Math.abs(p.x)), ...rotated.map(p => Math.abs(p.y)), 1);
       const scale = Math.min(rect.width, rect.height) * .39 / span * camera.zoom;
@@ -1625,6 +1626,10 @@ export default function Home() {
     const recovered = missingIndices.size ? placeMissingCoordinates(analyzed.points, analyzed.panels, analyzed.pitch, missingIndices) : { points: analyzed.points, panels: analyzed.panels, placed: 0, unresolved: 0 };
     setPoints(recovered.points);
     setPanels(recovered.panels);
+    if (recovered.panels.length === 1) {
+      setMapCamera(frontalPanelCamera(recovered.panels[0], recovered.points, analyzed.pitch));
+      setView('Panel');
+    }
     const suggestions = suggestModulesFromScan(recovered.points, recovered.panels, analyzed.pitch, mapCamera);
     setModules(suggestions);
     setActiveModuleId(suggestions[0]?.id ?? '');
@@ -1831,6 +1836,10 @@ export default function Home() {
   };
   const selectView = (nextView: string) => {
     setView(nextView);
+    if (nextView === 'Panel' && active) {
+      setMapCamera(frontalPanelCamera(active, points, pitch, mapCamera.zoom));
+      return;
+    }
     setMapCamera(current => nextView === 'Top' ? { yaw: 0, pitch: -Math.PI / 2, zoom: current.zoom } : nextView === 'Front' ? { yaw: 0, pitch: 0, zoom: current.zoom } : nextView === 'Side' ? { yaw: -Math.PI / 2, pitch: 0, zoom: current.zoom } : { yaw: -.5, pitch: -.28, zoom: current.zoom });
   };
   const addSelection = () => {
@@ -1966,7 +1975,7 @@ export default function Home() {
             <button className={showPixelNumbers ? 'tool active' : 'tool'} aria-pressed={showPixelNumbers} onClick={() => setShowPixelNumbers(value => !value)}># {t('Show pixel numbers', 'Pixelnummern anzeigen')}</button>
             <button className={showModuleNumbers ? 'tool active' : 'tool'} aria-pressed={showModuleNumbers} onClick={() => setShowModuleNumbers(value => !value)}># {t('Builder numbers', 'Baukasten-Nummern')}</button>
           </div>
-          <div className="data-card"><span>{t('Module coverage', 'Modulbelegung')}</span><strong>{assignedCount}/{points.length}</strong><small>{unassignedCount ? t(`${unassignedCount} slots still free`, `${unassignedCount} Slots noch frei`) : t('Complete · ready for MMFL', 'Vollständig · bereit für MMFL')}</small></div>
+          <div className="data-card"><span>{t('Module coverage', 'Modulbelegung')}</span><strong>{assignedCount}/{points.length}</strong><small>{unassignedCount ? t(`${unassignedCount} slots still free`, `${unassignedCount} Slots noch frei`) : modularGrid.collisions.length ? t('Complete · check overlapping pixels', 'Vollständig · überlappende Pixel prüfen') : t('Complete · ready for MMFL', 'Vollständig · bereit für MMFL')}</small></div>
           <p className="privacy-note">{t('Your mapping file stays on this device and is never uploaded.', 'Deine Mapping-Datei bleibt auf diesem Gerät und wird nicht hochgeladen.')}</p>
         </aside>
 
@@ -1975,7 +1984,7 @@ export default function Home() {
             <div><span className="eyebrow">{stageMode === '3d' ? '3D MAP' : t('MODULAR MMFL BUILDER', 'MODULARER MMFL-BAUKASTEN')}</span><h1>{stageMode === '3d' ? fileName : activeModule?.name ?? t('No module selected', 'Kein Modul ausgewählt')}</h1></div>
             <div className="stage-actions"><button className="swap-button" onClick={() => setStageMode(mode => mode === '3d' ? 'builder' : '3d')}>⇄ {stageMode === '3d' ? t('Open builder', 'Baukasten öffnen') : t('Show 3D scan', '3D-Scan zeigen')}</button>{stageMode === 'builder' && <button onClick={alignModulesToCurrentScanView}>⌁ {t('Match 3D view', 'An 3D-Ansicht anpassen')}</button>}</div>
             {stageMode === '3d' && <div className="view-switch">{[
-              { id: '3D', label: '3D' }, { id: 'Top', label: t('Top', 'Oben') }, { id: 'Front', label: 'Front' }, { id: 'Side', label: t('Side', 'Seite') },
+              { id: 'Panel', label: t('Panel front', 'Panel frontal') }, { id: '3D', label: '3D' }, { id: 'Top', label: t('Top', 'Oben') }, { id: 'Front', label: 'Front' }, { id: 'Side', label: t('Side', 'Seite') },
             ].map(item => <button key={item.id} className={view === item.id ? 'selected' : ''} onClick={() => selectView(item.id)}>{item.label}</button>)}</div>}
           </div>
           <div className={`viewport ${stageMode === 'builder' ? 'viewport-builder' : ''}`}>
@@ -2026,9 +2035,7 @@ export default function Home() {
               <div className="module-editor-title"><span>{t('Active module', 'Aktives Modul')}</span><button onClick={() => removeModule(activeModule.id)}>{t('Remove', 'Entfernen')}</button></div>
               <label>{t('Name', 'Name')}<input value={activeModule.name} onChange={event => updateModule({ ...activeModule, name: event.target.value })} /></label>
               <div className="module-meta"><span>{t('Assigned range', 'Zugewiesener Bereich')} <b>#{activeModule.startIndex + 1}–{activeModule.startIndex + modulePixelCount(activeModule)}</b></span><span>{activeModule.sourceCells ? t('measured scan path', 'gemessener Scan-Pfad') : activeModule.wiringDetected ? t('scan-assisted', 'scan-unterstützt') : t('manual wiring', 'manuelle Verdrahtung')}</span></div>
-              {activeModule.sourceCells ? <p className="single-note">{activeModule.sourceStep === 1
-                ? t('Dense-strip LEDs occupy adjacent grid cells. Horizontal rows use every second grid row, leaving exactly one symmetric intermediate row for the crossing strip.', 'Die LEDs des dichten Strangs belegen direkt benachbarte Rasterzellen. Horizontale Reihen nutzen jede zweite Rasterzeile; dazwischen bleibt genau eine symmetrische Zeile für den kreuzenden Strang.')
-                : t(`This crossing strand uses a constant interval of ${activeModule.sourceGridStep ?? 2} grid cells and is snapped to the intermediate rows of the dense strip.`, `Dieser kreuzende Strang verwendet konstant ${activeModule.sourceGridStep ?? 2} Rasterzellen Abstand und wird auf die Zwischenzeilen des dichten Strangs eingerastet.`)}</p> : <>
+              {activeModule.sourceCells ? <p className="single-note">{t('Front-facing scan path: measured turns, gaps and relative positions are retained. Supported straight runs use the strand’s measured spacing. The shared grid is refined when necessary; ambiguous overlaps remain marked for review.', 'Frontaler Scan-Pfad: Gemessene Kurven, Lücken und relative Positionen bleiben erhalten. Eindeutige gerade Abschnitte verwenden den gemessenen Strangabstand. Das gemeinsame Raster wird bei Bedarf verfeinert; unklare Überlappungen bleiben zur Prüfung markiert.')}</p> : <>
                 <div className="module-grid-fields"><label>{t('Flow', 'Verlauf')}<select value={activeModule.order} onChange={event => updateModule({ ...activeModule, order: event.target.value as ModuleOrder, wiringDetected: false })}><option value="rows">{t('Rows first', 'Zeilen zuerst')}</option><option value="columns">{t('Columns first', 'Spalten zuerst')}</option></select></label><label>{t('Start corner', 'Startecke')}<select value={activeModule.startCorner} onChange={event => updateModule({ ...activeModule, startCorner: event.target.value as ModuleCorner, wiringDetected: false })}><option value="tl">↖ TL</option><option value="tr">↗ TR</option><option value="bl">↙ BL</option><option value="br">↘ BR</option></select></label></div>
                 <label className="check-row"><input type="checkbox" checked={activeModule.zigzag} onChange={event => updateModule({ ...activeModule, zigzag: event.target.checked, wiringDetected: false })} /> {t('Zigzag / serpentine wiring', 'Zickzack-/Serpentinen-Verdrahtung')}</label>
                 <button className="detect-wiring" onClick={redetectWiring}>◇ {t('Detect wiring from scan', 'Verdrahtung aus Scan erkennen')}</button>
@@ -2083,6 +2090,7 @@ export default function Home() {
       {showExport && <div className="modal-backdrop" onMouseDown={() => setShowExport(false)}><section className="modal" onMouseDown={event => event.stopPropagation()} aria-modal="true" role="dialog" aria-labelledby="export-title">
         <button className="modal-close" aria-label={t('Close', 'Schließen')} onClick={() => setShowExport(false)}>×</button><span className="eyebrow">EXPORT</span><h2 id="export-title">{t('Create MadMapper fixture', 'MadMapper Fixture erstellen')}</h2><p className="modal-lead">{t('MMFL uses the modular output grid. SVG and CSV continue to use the enabled scan regions.', 'MMFL verwendet das modulare Ausgaberaster. SVG und CSV verwenden weiterhin die aktivierten Scan-Bereiche.')}</p>
         <div className="export-summary"><span>{t('Modules', 'Module')}<b>{modules.length}</b></span><span>{t('Assigned', 'Zugewiesen')}<b>{assignedCount}/{points.length}</b></span><span>{t('Hidden', 'Ausgeblendet')}<b>{hiddenIndices.length}</b></span><span>{t('Grid', 'Raster')}<b>{modularGrid.width}×{modularGrid.height}</b></span><span className={modularGrid.collisions.length ? 'bad' : ''}>{t('Collisions', 'Kollisionen')}<b>{modularGrid.collisions.length}</b></span></div>
+        {modularGrid.collisions.length > 0 && <p role="alert">{t('Overlapping display pixel numbers (CSV index + 1)', 'Überlappende angezeigte Pixelnummern (CSV-Index + 1)')}: {modularGrid.collisions.slice(0, 12).join(', ')}. {t('Check these scan positions. Strands are not moved automatically to hide ambiguous readings.', 'Prüfe diese Scanpositionen. Streifen werden nicht automatisch verschoben, um unklare Messwerte zu verdecken.')}</p>}
         <div className="form-grid"><label>Fixture Definition<input value={settings.definition} onChange={event => setSettings(current => ({ ...current, definition: event.target.value }))} /></label><label>{t('Channels per pixel', 'Kanäle pro Pixel')}<select value={settings.channels} onChange={event => setSettings(current => ({ ...current, channels: Number(event.target.value), definition: Number(event.target.value) === 4 ? 'Generic - Pixel RGBW' : 'Generic - Pixel RGB' }))}><option value={3}>RGB · 3</option><option value={4}>RGBW · 4</option></select></label><label>{t('Start universe', 'Start Universe')}<input type="number" min="0" max="32767" value={settings.universe} onChange={event => setSettings(current => ({ ...current, universe: Math.max(0, Number(event.target.value)) }))} /></label><label>{t('Start channel', 'Start Channel')}<input type="number" min="1" max="512" value={settings.channel} onChange={event => setSettings(current => ({ ...current, channel: Math.max(1, Math.min(512, Number(event.target.value))) }))} /></label><label>{t('Pixel size in MadMapper', 'Pixelgröße in MadMapper')}<input type="number" min="1" max="64" value={settings.ledSize} onChange={event => setSettings(current => ({ ...current, ledSize: Math.max(1, Number(event.target.value)) }))} /></label></div>
         <p className="file-name-preview">{t('Saved as', 'Wird gespeichert als')}: <strong>{safeName(settings.definition)}.[svg/csv/mmfl]</strong></p>
         <div className="format-cards"><button onClick={() => exportFile('svg')}><b>SVG 6.1</b><span>{t('Freeform', 'Freiform')}</span><small>{t('Exact projected positions and DMX patch from enabled scan regions.', 'Exakte projizierte Positionen und DMX-Patch aus aktivierten Scan-Bereichen.')}</small></button><button onClick={() => exportFile('csv')}><b>CSV</b><span>{t('Table', 'Tabelle')}</span><small>{t('Individual fixtures with position, definition and patch.', 'Einzel-Fixtures mit Position, Definition und Patch.')}</small></button><button disabled={unassignedCount > 0 || modularGrid.collisions.length > 0} onClick={() => exportFile('mmfl')}><b>MMFL</b><span>{t('Modular grid', 'Modulraster')}</span><small>{unassignedCount ? t(`Assign ${unassignedCount} remaining LED slots first.`, `Weise zuerst die ${unassignedCount} übrigen LED-Slots zu.`) : modularGrid.collisions.length ? t(`Resolve ${modularGrid.collisions.length} grid collisions first.`, `Löse zuerst ${modularGrid.collisions.length} Rasterkollisionen.`) : t('Ready: hidden pixels remain empty while reserving their original channel offsets.', 'Bereit: ausgeblendete Pixel bleiben leer und reservieren ihre ursprünglichen Kanalabstände.')}</small></button></div>
@@ -2094,7 +2102,7 @@ export default function Home() {
         <div className="help-row"><b>Import</b><p>{t('Pixelblaze JSON, Marimapper 3D CSV ', 'Pixelblaze-JSON sowie Marimapper-3D-CSV ')}(<code>index,x,y,z,xn,yn,zn,error</code>) {t('and 2D CSV ', 'und 2D-CSV ')}(<code>index,u,v</code>). {t('For CSV files, the app asks for the expected LED count. Only internal gaps are automatic; extra trailing LEDs require an explicitly larger count. Missing entries are positioned from locally detected zigzag rows, allowing multiple matrix sizes in one scan, then marked as inferred and included in export.', 'Bei CSV-Dateien fragt die App nach der erwarteten LED-Anzahl. Nur interne Lücken werden automatisch ergänzt; zusätzliche Endpixel erfordern eine ausdrücklich größere Anzahl. Fehlende Einträge werden aus lokal erkannten Zickzack-Zeilen positioniert, sodass mehrere Matrixgrößen in einem Scan möglich sind; anschließend werden sie als berechnet markiert und exportiert.')}</p></div>
         <div className="help-row"><b>SVG 6.1</b><p>{t('Use File → Import Fixtures. Each LED becomes its own fixture with current ', 'Für File → Import Fixtures. Jede LED wird als eigenes Fixture mit aktuellen ')}<code>universe</code>, <code>channel</code> {t('and', 'und')} <code>fixture_definition</code> {t('attributes.', 'Attributen angelegt.')}</p></div>
         <div className="help-row"><b>CSV</b><p>{t('A robust table alternative for fixture instances, semicolon-delimited and grouped by panel path.', 'Robuste Tabellenalternative für Fixture-Instanzen. Semikolon-getrennt und mit Gruppenpfaden pro Panel.')}</p></div>
-        <div className="help-row"><b>{t('Builder', 'Baukasten')}</b><p>{t('Assign every imported LED exactly once to a matrix, strip or single-pixel module. Automatic suggestions copy the relative position, projected orientation and size from the retained 3D camera. Rotate the 3D view and use Match current 3D arrangement whenever you want a different projection; then fine-tune individual modules.', 'Ordne jede importierte LED genau einmal einem Matrix-, Streifen- oder Einzelpixel-Modul zu. Automatische Vorschläge übernehmen relative Position, projizierte Ausrichtung und Größe aus der gespeicherten 3D-Kamera. Drehe die 3D-Ansicht und nutze Aktuelle 3D-Anordnung übernehmen, wenn du eine andere Projektion möchtest; anschließend kannst du einzelne Module fein einstellen.')}</p></div>
+        <div className="help-row"><b>{t('Builder', 'Baukasten')}</b><p>{t('Single-panel scans are fitted to their physical plane and viewed front-on before suggestions are generated. Panel front restores this view. Scan paths share one coordinate system and retain gaps, turns and relative positions. Regular matrices use orthogonal cells. Ambiguous overlapping readings remain visible for review instead of moving strands apart.', 'Einzelne Panels werden vor der Vorschlagserstellung an ihrer physischen Ebene ausgerichtet und frontal betrachtet. Panel frontal stellt diese Ansicht wieder her. Scan-Pfade teilen ein Koordinatensystem und behalten Lücken, Kurven und relative Positionen. Reguläre Matrizen nutzen orthogonale Zellen. Unklare überlappende Messwerte bleiben zur Prüfung sichtbar, statt Streifen auseinanderzuschieben.')}</p></div>
         <div className="help-row"><b>MMFL</b><p>{t('For import in the Fixture Editor. The product name comes from Fixture Definition. A physically present but unused LED is stored as an empty grid cell; later LED addresses still derive from their original source indices, so the unused LED continues to reserve its wiring/DMX position.', 'Für den Import im Fixture Editor. Der Produktname stammt aus Fixture Definition. Eine physisch vorhandene, aber unbenutzte LED wird als leere Rasterzelle gespeichert; spätere LED-Adressen werden weiterhin aus ihren ursprünglichen Quellindizes berechnet, sodass die unbenutzte LED ihre Verdrahtungs-/DMX-Position reserviert.')}</p></div>
         <div className="help-warning">{t('Legacy MadMapper 5 SVG attributes are intentionally omitted. The export follows the current 6.1 documentation.', 'Alte MadMapper-5-SVG-Attribute werden bewusst nicht verwendet. Der Export folgt der aktuellen 6.1-Dokumentation.')}</div>
       </section></div>}
