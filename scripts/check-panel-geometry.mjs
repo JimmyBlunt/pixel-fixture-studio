@@ -9,10 +9,47 @@ const geometry = source.split('function MapCanvas')[0];
 const normalization = source.slice(source.indexOf('function normalizeDegrees'), source.indexOf('function FixturePreview'));
 const context = { exports: {} };
 vm.createContext(context);
-vm.runInContext(ts.transpileModule(`${geometry}\n${normalization}\nglobalThis.api = { analyze, parseMarimapperCsv, placeMissingCoordinates, frontalPanelBasis, frontalPanelCamera, projectXyz, projectScanToCamera, quantizePanelScanGrid, suggestModulesFromScan, moduleGrid };`, {
+vm.runInContext(ts.transpileModule(`${geometry}\n${normalization}\nglobalThis.api = { analyze, parseMarimapperCsv, placeMissingCoordinates, frontalPanelBasis, frontalPanelCamera, projectXyz, projectScanToCamera, quantizePanelScanGrid, suggestModulesFromScan, moduleGrid, makeModule, moduleCells, moveModulePixel, scaleFixtureModules, newCollisionCount, buildModuleMmfl };`, {
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
 }).outputText, context);
 const api = context.api;
+
+for (const rotation of [0, 37, 90, -90, 180]) {
+  const strip = { ...api.makeModule('Test', 'strip', 0, 1, 8, 0), rotation };
+  const before = api.moduleCells(strip, 3);
+  const updated = api.moveModulePixel(strip, 3, 1, -1);
+  const after = api.moduleCells(updated, 3);
+  for (let index = 0; index < before.length; index++) {
+    assert.ok(Math.abs(after[index].x - before[index].x - (index === 3 ? 1 : 0)) < 1e-9);
+    assert.ok(Math.abs(after[index].y - before[index].y - (index === 3 ? -1 : 0)) < 1e-9);
+    assert.equal(after[index].value, before[index].value);
+  }
+  assert.equal(strip.pixelOffsets, undefined, 'Preview edits must not mutate original modules');
+  const scaled = api.scaleFixtureModules([updated], .5);
+  api.moduleCells(scaled[0], 3).forEach((cell, index) => {
+    assert.ok(Math.abs(cell.x - after[index].x * .5) < 1e-9);
+    assert.ok(Math.abs(cell.y - after[index].y * .5) < 1e-9);
+    assert.equal(cell.value, after[index].value);
+  });
+}
+const sparse = { ...api.makeModule('Sparse', 'strip', 0, 1, 8, 0), width: 28 };
+assert.ok(api.moduleGrid(api.scaleFixtureModules([sparse], .5), 3).width < api.moduleGrid([sparse], 3).width);
+assert.equal(api.newCollisionCount([sparse], api.scaleFixtureModules([sparse], .5), 3), 0);
+assert.ok(api.newCollisionCount([sparse], api.scaleFixtureModules([sparse], .1), 3) > 0);
+const multiMoved = [1, 2, 3].reduce((module, index) => api.moveModulePixel(module, index, 0, 1), sparse);
+api.moduleCells(multiMoved, 3).forEach((cell, index) => {
+  const before = api.moduleCells(sparse, 3)[index];
+  assert.equal(cell.x, before.x);
+  assert.equal(cell.y - before.y, [1, 2, 3].includes(index) ? 1 : 0);
+});
+for (const channels of [3, 4]) {
+  const compact = api.scaleFixtureModules([multiMoved], .5);
+  const xml = api.buildModuleMmfl(compact, 8, { channels, definition: 'Edited fixture' });
+  const values = xml.match(/<PixelMapping[^>]*>([^<]+)<\/PixelMapping>/)[1].trim().split(/\s+/).map(Number).filter(Boolean).sort((a, b) => a - b);
+  assert.deepEqual(values, Array.from({ length: 8 }, (_, index) => 1 + index * channels));
+  assert.ok(xml.includes('product="Edited fixture"'));
+}
+console.log('PASS: single-pixel movement, rotated strips, immutable preview, spacing reduction, collision guard, unchanged addresses.');
 
 // Unequal horizontal and vertical serpentine runs, with an intentionally empty centre.
 const coords = [];

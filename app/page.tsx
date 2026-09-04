@@ -30,6 +30,8 @@ type PixelModule = {
   sourceCells?: ModuleSourceCell[];
   sourceStep?: number;
   sourceGridStep?: number;
+  // Local fixture-only corrections; original scan positions and DMX indices never change.
+  pixelOffsets?: Record<number, { x: number; y: number }>;
   hiddenIndices: number[];
   color: string;
 };
@@ -343,7 +345,8 @@ function moduleCells(module: PixelModule, channels: number): ModuleCell[] {
   return assignments.map(({ sourceIndex, row, column }) => {
     const localX = module.columns <= 1 ? module.width / 2 : column / (module.columns - 1) * module.width;
     const localY = module.rows <= 1 ? module.height / 2 : row / (module.rows - 1) * module.height;
-    const dx = localX - module.width / 2, dy = localY - module.height / 2;
+    const correction = module.pixelOffsets?.[sourceIndex];
+    const dx = localX - module.width / 2 + (correction?.x ?? 0), dy = localY - module.height / 2 + (correction?.y ?? 0);
     return {
       moduleId: module.id,
       sourceIndex,
@@ -374,6 +377,44 @@ function moduleGrid(modules: PixelModule[], channels: number) {
     height: Math.max(...cells.map(cell => cell.gridY)) + 1,
     collisions,
   };
+}
+
+/** Move just one fixture pixel by exact screen-grid steps, including rotated/one-row modules. */
+function moveModulePixel(module: PixelModule, sourceIndex: number, dx: number, dy: number): PixelModule {
+  if (!moduleIndices(module).includes(sourceIndex)) return module;
+  const angle = module.rotation * Math.PI / 180, c = Math.cos(angle), s = Math.sin(angle);
+  const previous = module.pixelOffsets?.[sourceIndex] ?? { x: 0, y: 0 };
+  return { ...module, pixelOffsets: { ...module.pixelOffsets, [sourceIndex]: {
+    x: previous.x + dx * c + dy * s,
+    y: previous.y - dx * s + dy * c,
+  } } };
+}
+
+function moduleCollisionGroups(modules: PixelModule[], channels: number) {
+  const occupied = new Map<string, ModuleCell[]>();
+  modules.flatMap(module => moduleCells(module, channels)).forEach(cell => {
+    const key = `${Math.round(cell.x)}:${Math.round(cell.y)}`;
+    occupied.set(key, [...(occupied.get(key) ?? []), cell]);
+  });
+  return [...occupied.entries()].filter(([, cells]) => cells.length > 1).map(([key, cells]) => ({
+    key, x: Math.round(cells[0].x), y: Math.round(cells[0].y), cells,
+  }));
+}
+
+/** Scale fixture geometry, not the viewport; keep all source slots and channel offsets. */
+function scaleFixtureModules(modules: PixelModule[], factor: number): PixelModule[] {
+  if (!Number.isFinite(factor) || factor <= 0) return modules;
+  return modules.map(module => ({ ...module, x: module.x * factor, y: module.y * factor,
+    width: module.width * factor, height: module.height * factor,
+    pixelOffsets: module.pixelOffsets && Object.fromEntries(Object.entries(module.pixelOffsets).map(([index, offset]) => [index, { x: offset.x * factor, y: offset.y * factor }])),
+  }));
+}
+
+function newCollisionCount(original: PixelModule[], draft: PixelModule[], channels: number) {
+  const pairs = (modules: PixelModule[]) => moduleCollisionGroups(modules, channels).flatMap(group =>
+    group.cells.flatMap((cell, index) => group.cells.slice(index + 1).map(other => [cell.sourceIndex, other.sourceIndex].sort((a, b) => a - b).join(':'))));
+  const previous = new Set(pairs(original));
+  return pairs(draft).filter(pair => !previous.has(pair)).length;
 }
 
 function makeModule(name: string, kind: PixelModuleKind, startIndex: number, rows: number, columns: number, position: number): PixelModule {
@@ -1508,6 +1549,128 @@ function RepairPreview({ panel, points, suggestions, zoom, onZoomChange, languag
   return <canvas ref={ref} className="repair-canvas interactive" onPointerDown={pointerDown} onPointerMove={pointerMove} onPointerUp={pointerUp} onPointerCancel={pointerUp} onDoubleClick={() => setPan({ x: 0, y: 0 })} onWheel={wheel} aria-label={translated(language, 'Zoomable before-and-after preview: drag to pan, use the wheel to zoom', 'Zoombare Vorher-Nachher-Vorschau: ziehen verschiebt, Mausrad zoomt')} />;
 }
 
+/** Transactional correction: editing is a preview until the user explicitly applies it. */
+function PixelCollisionEditor({ modules, channels, language, mode, onApply, onClose }: {
+  modules: PixelModule[]; channels: number; language: Language;
+  mode: 'collisions' | 'pixels';
+  onApply: (modules: PixelModule[]) => void; onClose: () => void;
+}) {
+  const t = (en: string, de: string) => translated(language, en, de);
+  const originalGroups = useMemo(() => moduleCollisionGroups(modules, channels), [modules, channels]);
+  const [draft, setDraft] = useState(modules);
+  const [groupIndex, setGroupIndex] = useState(0);
+  const firstGroup = originalGroups[0];
+  const originalCells = useMemo(() => modules.flatMap(module => moduleCells(module, channels)), [modules, channels]);
+  const initialPixel = firstGroup?.cells.at(-1) ?? originalCells[0];
+  const bounds = (items: ModuleCell[]) => ({ minX: Math.min(...items.map(cell => cell.x)), maxX: Math.max(...items.map(cell => cell.x)), minY: Math.min(...items.map(cell => cell.y)), maxY: Math.max(...items.map(cell => cell.y)) });
+  const initialBounds = bounds(originalCells);
+  const [selected, setSelected] = useState(initialPixel);
+  const [selectionIds, setSelectionIds] = useState(new Set(initialPixel ? [initialPixel.sourceIndex] : []));
+  const [selectionText, setSelectionText] = useState('');
+  const [selectionError, setSelectionError] = useState('');
+  const [fixtureScale, setFixtureScale] = useState(1);
+  const [center, setCenter] = useState(mode === 'collisions' ? { x: firstGroup?.x ?? 0, y: firstGroup?.y ?? 0 } : { x: (initialBounds.minX + initialBounds.maxX) / 2, y: (initialBounds.minY + initialBounds.maxY) / 2 });
+  const [zoom, setZoom] = useState(mode === 'collisions' ? 1 : Math.max(.05, Math.min(1, 640 / (52 * (initialBounds.maxX - initialBounds.minX + 3)), 420 / (52 * (initialBounds.maxY - initialBounds.minY + 3)))));
+  const dialog = useRef<HTMLElement>(null);
+  useEffect(() => { dialog.current?.focus(); }, []);
+  const cells = draft.flatMap(module => moduleCells(module, channels));
+  const remaining = moduleCollisionGroups(draft, channels);
+  // Keep newly created overlaps selectable after grid compaction, too.
+  const reviewGroups = remaining.length ? remaining : originalGroups;
+  const newCollisions = newCollisionCount(modules, draft, channels);
+  const previewGrid = moduleGrid(draft, channels);
+  const conflictKeys = new Set(remaining.map(group => group.key));
+  const active = cells.find(cell => cell.moduleId === selected?.moduleId && cell.sourceIndex === selected?.sourceIndex);
+  const original = modules.flatMap(module => moduleCells(module, channels)).find(cell => cell.moduleId === selected?.moduleId && cell.sourceIndex === selected?.sourceIndex);
+  const unit = 52 * zoom;
+  const screen = (x: number, y: number) => ({ x: 360 + (Math.round(x) - center.x) * unit, y: 250 + (Math.round(y) - center.y) * unit });
+  const move = (dx: number, dy: number) => {
+    setDraft(items => items.map(module => [...selectionIds].reduce((updated, index) => moveModulePixel(updated, index, dx, dy), module)));
+  };
+  const selectCell = (cell: ModuleCell, additive = false) => {
+    dialog.current?.focus();
+    setSelected(cell);
+    setSelectionIds(previous => { const next = additive ? new Set(previous) : new Set<number>(); if (additive && next.has(cell.sourceIndex)) next.delete(cell.sourceIndex); else next.add(cell.sourceIndex); return next; });
+  };
+  const fitView = (items = cells) => {
+    const b = bounds(items);
+    setCenter({ x: (b.minX + b.maxX) / 2, y: (b.minY + b.maxY) / 2 });
+    setZoom(Math.max(.05, Math.min(2, 640 / (52 * (b.maxX - b.minX + 3)), 420 / (52 * (b.maxY - b.minY + 3)))));
+  };
+  const setScale = (value: number) => {
+    const next = scaleFixtureModules(draft, value / fixtureScale);
+    setDraft(next); setFixtureScale(value); fitView(next.flatMap(module => moduleCells(module, channels)));
+  };
+  const selectNumbers = () => {
+    const ids = new Set<number>(), available = new Set(cells.map(cell => cell.sourceIndex));
+    for (const token of selectionText.split(/[,;\s]+/).filter(Boolean)) {
+      const match = /^(\d+)(?:-(\d+))?$/.exec(token);
+      if (!match) { setSelectionError(t('Use pixel numbers or ranges, e.g. 83, 90-95.', 'Nutze Pixelnummern oder Bereiche, z. B. 83, 90-95.')); return; }
+      const first = Number(match[1]), last = Number(match[2] ?? match[1]);
+      if (last < first || last - first > cells.length) { setSelectionError(t('Invalid pixel range.', 'Ungültiger Pixelbereich.')); return; }
+      for (let number = first; number <= last; number++) { if (!available.has(number - 1)) { setSelectionError(t(`Pixel ${number} does not exist.`, `Pixel ${number} existiert nicht.`)); return; } ids.add(number - 1); }
+    }
+    if (!ids.size) return;
+    setSelectionIds(ids); setSelected(cells.find(cell => ids.has(cell.sourceIndex))!); setSelectionError('');
+    fitView(cells.filter(cell => ids.has(cell.sourceIndex)));
+    dialog.current?.focus();
+  };
+  const chooseGroup = (index: number) => {
+    const group = reviewGroups[index];
+    setGroupIndex(index); selectCell(group.cells.at(-1)!); setCenter({ x: group.x, y: group.y }); setZoom(1);
+  };
+  const keyDown = (event: React.KeyboardEvent<HTMLElement>) => {
+    if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); onClose(); return; }
+    if (event.key === 'Tab') {
+      const controls = Array.from(dialog.current?.querySelectorAll<HTMLElement>('button:not(:disabled), input, select, [tabindex="0"]') ?? []);
+      const first = controls[0], last = controls.at(-1);
+      if (event.shiftKey && (document.activeElement === first || document.activeElement === dialog.current)) { event.preventDefault(); last?.focus(); }
+      else if (!event.shiftKey && (document.activeElement === last || document.activeElement === dialog.current)) { event.preventDefault(); first?.focus(); }
+      return;
+    }
+    if (['INPUT', 'SELECT', 'TEXTAREA'].includes((event.target as HTMLElement).tagName)) return;
+    const directions: Record<string, [number, number]> = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
+    if (directions[event.key]) { event.preventDefault(); event.stopPropagation(); move(...directions[event.key]); }
+  };
+  const visible = cells.filter(cell => { const p = screen(cell.x, cell.y); return p.x >= 12 && p.x <= 708 && p.y >= 12 && p.y <= 488; });
+  const groups = new Map<string, ModuleCell[]>();
+  visible.forEach(cell => { const key = `${Math.round(cell.x)}:${Math.round(cell.y)}`; groups.set(key, [...(groups.get(key) ?? []), cell]); });
+  const before = original && screen(original.x, original.y), after = active && screen(active.x, active.y);
+  return <div className="modal-backdrop"><section ref={dialog} tabIndex={-1} className="modal pixel-collision-modal" role="dialog" aria-modal="true" aria-labelledby="pixel-collision-title" onKeyDown={keyDown}>
+    <button className="modal-close" aria-label={t('Cancel correction', 'Korrektur abbrechen')} onClick={onClose}>×</button>
+    <h2 id="pixel-collision-title">{t('Edit pixels & compact grid', 'Pixel bearbeiten & Raster verdichten')}</h2>
+    <p>{t('Click a pixel; Ctrl/⌘ or Shift-click adds/removes pixels. Move the selection with arrow keys or buttons. Enter numbers to select overlapping pixels individually.', 'Pixel anklicken; Strg/⌘- oder Umschalt-Klick ergänzt/entfernt Pixel. Auswahl mit Pfeiltasten oder Schaltflächen verschieben. Überlappende Pixel kannst du einzeln per Nummer wählen.')}</p>
+    <div className="collision-picker">{reviewGroups.map((group, index) => <button key={group.key} aria-pressed={groupIndex === index} onClick={() => chooseGroup(index)}>{group.cells.map(cell => `#${cell.sourceIndex + 1}`).join(' / ')}</button>)}</div>
+    <div className="collision-editor-layout"><div>
+      <svg className="collision-detail" viewBox="0 0 720 500" role="img" aria-label={t('Enlarged output grid with pixel numbers and proposed position', 'Vergrößertes Ausgaberaster mit Pixelnummern und vorgeschlagener Position')}>
+        <defs><pattern id="collision-detail-grid" width={unit} height={unit} x={360 - (center.x + .5) * unit} y={250 - (center.y + .5) * unit} patternUnits="userSpaceOnUse"><rect width={unit} height={unit} fill="none" stroke="#303a50" strokeWidth="1" /></pattern></defs>
+        <rect width="720" height="500" fill="url(#collision-detail-grid)" />
+        {before && after && (before.x !== after.x || before.y !== after.y) && <g><circle cx={before.x} cy={before.y} r="20" fill="none" stroke="#ffb454" strokeDasharray="5 4" /><line x1={before.x} y1={before.y} x2={after.x} y2={after.y} stroke="#ffb454" strokeWidth="2" strokeDasharray="5 4" /></g>}
+        {[...groups].map(([key, group]) => {
+          const p = screen(group[0].x, group[0].y), isSelected = group.some(cell => selectionIds.has(cell.sourceIndex)), size = Math.max(5, Math.min(28, unit * .7));
+          return <g key={key} role="button" aria-label={group.map(cell => `Pixel ${cell.sourceIndex + 1}`).join(' / ')} onClick={event => selectCell(group[0], event.ctrlKey || event.metaKey || event.shiftKey)} style={{ cursor: 'pointer' }}><rect x={p.x - size / 2} y={p.y - size / 2} width={size} height={size} rx="3" fill={conflictKeys.has(key) ? '#e56e42' : isSelected ? '#49dcb3' : '#627395'} stroke={isSelected ? '#fff' : 'none'} strokeWidth="2" opacity={group.every(cell => cell.hidden) ? .35 : 1} />
+            {unit >= 25 && <text x={p.x} y={p.y - size / 2 - 7} textAnchor="middle" fill="#fff" fontSize="14">{group.map(cell => `#${cell.sourceIndex + 1}`).join(' / ')}</text>}</g>;
+        })}
+      </svg>
+      <div className="collision-zoom"><label>{t('View zoom', 'Ansichts-Zoom')} <input type="range" min="0.05" max="2" step="0.05" value={zoom} onChange={event => setZoom(Number(event.target.value))} /></label><button onClick={() => { if (active) { setCenter({ x: Math.round(active.x), y: Math.round(active.y) }); setZoom(1); } }}>{t('Centre selected pixel', 'Gewählten Pixel zentrieren')}</button><button onClick={() => fitView()}>{t('Fit fixture', 'Gesamte Fixture')}</button></div>
+    </div><div className="collision-controls">
+      <strong>{t(`${selectionIds.size} pixels selected`, `${selectionIds.size} Pixel ausgewählt`)}</strong>
+      <label>{t('Pixel numbers / ranges', 'Pixelnummern / Bereiche')}<input value={selectionText} placeholder="83, 90-95" onChange={event => setSelectionText(event.target.value)} onKeyDown={event => { if (event.key === 'Enter') { event.preventDefault(); selectNumbers(); } }} /></label><button onClick={selectNumbers}>{t('Select pixels', 'Pixel auswählen')}</button>
+      {selectionError && <p role="alert">{selectionError}</p>}
+      <div className="collision-picker">{reviewGroups[Math.min(groupIndex, reviewGroups.length - 1)]?.cells.map(cell => <button key={`${cell.moduleId}:${cell.sourceIndex}`} aria-pressed={selectionIds.has(cell.sourceIndex)} onClick={() => selectCell(cell)}>Pixel {cell.sourceIndex + 1}</button>)}</div>
+      {active && <p>{t('Selected', 'Ausgewählt')}: <b>#{active.sourceIndex + 1}</b><br />{t('CSV index', 'CSV-Index')}: {active.sourceIndex}<br />{t('Channel offset', 'Kanaloffset')}: {active.value}<br />{t('Grid position', 'Rasterposition')}: {Math.round(active.x)}, {Math.round(active.y)}</p>}
+      <div className="collision-arrows"><button aria-label={t('Move pixel up', 'Pixel nach oben')} onClick={() => move(0, -1)}>↑</button><button aria-label={t('Move pixel left', 'Pixel nach links')} onClick={() => move(-1, 0)}>←</button><button aria-label={t('Move pixel down', 'Pixel nach unten')} onClick={() => move(0, 1)}>↓</button><button aria-label={t('Move pixel right', 'Pixel nach rechts')} onClick={() => move(1, 0)}>→</button></div>
+      <label>{t('Fixture grid scale', 'Fixture-Rasterskalierung')} <b>{Math.round(fixtureScale * 100)}%</b><input type="range" min="0.25" max="2" step="0.05" value={fixtureScale} onChange={event => setScale(Number(event.target.value))} /></label>
+      <span>{previewGrid.width}×{previewGrid.height} {t('output cells', 'Ausgabezellen')}</span>
+      <small>{t('Below 100% reduces spacing across the entire fixture and snaps it to the output grid. Unlike view zoom, this changes the export.', 'Unter 100% werden Abstände der gesamten Fixture verkleinert und auf das Ausgaberaster gerundet. Anders als der Ansichts-Zoom verändert dies den Export.')}</small>
+      <p aria-live="polite">{newCollisions ? t(`${newCollisions} new collisions — reduce compaction or move pixels before applying.`, `${newCollisions} neue Kollisionen – weniger verdichten oder Pixel vor dem Übernehmen verschieben.`) : remaining.length ? t(`${remaining.length} existing overlapping cells remain.`, `${remaining.length} bestehende überlappende Zellen verbleiben.`) : t('No collisions — ready to apply.', 'Keine Kollisionen – bereit zum Übernehmen.')}</p>
+      <button onClick={() => { setDraft(modules); setFixtureScale(1); }}>{t('Reset preview', 'Vorschau zurücksetzen')}</button>
+      <small>{t('Green: selected pixel. Orange: overlap or previous position. Original 3D coordinates and channel addresses stay unchanged. Generating new module suggestions replaces these fixture corrections.', 'Grün: gewählter Pixel. Orange: Überlappung oder bisherige Position. Originale 3D-Koordinaten und Kanaladressen bleiben unverändert. Neue Modulvorschläge ersetzen diese Fixture-Korrekturen.')}</small>
+    </div></div>
+    <div className="modal-actions"><button className="secondary-button" onClick={onClose}>{t('Cancel', 'Abbrechen')}</button><button className="primary-button" disabled={draft === modules || newCollisions > 0} onClick={() => onApply(draft)}>{t('Apply correction', 'Korrektur übernehmen')}</button></div>
+  </section></div>;
+}
+
 export default function Home() {
   const initial = useMemo(() => analyze(makeDemo()), []);
   const initialModules = useMemo(() => initial.panels.map((panel, index) => ({
@@ -1542,6 +1705,7 @@ export default function Home() {
   const [message, setMessage] = useState('Demo data is active — load a Pixelblaze JSON or Marimapper CSV file.');
   const [error, setError] = useState('');
   const [showExport, setShowExport] = useState(false);
+  const [showCollisionEditor, setShowCollisionEditor] = useState<'collisions' | 'pixels' | null>(null);
   const [showHelp, setShowHelp] = useState(false);
   const [showAdjust, setShowAdjust] = useState(false);
   const [showRepair, setShowRepair] = useState(false);
@@ -1590,7 +1754,7 @@ export default function Home() {
   useEffect(() => {
     const moveWithKeyboard = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null;
-      if (!editMode || !selection.length || target?.matches('input, select, textarea, [contenteditable="true"]')) return;
+      if (showCollisionEditor || !editMode || !selection.length || target?.matches('input, select, textarea, [contenteditable="true"]')) return;
       const amount = moveStep * (event.shiftKey ? 10 : 1);
       const delta: Vec3 | undefined = event.key === 'ArrowLeft' ? [-amount, 0, 0] : event.key === 'ArrowRight' ? [amount, 0, 0] : event.key === 'ArrowUp' ? [0, amount, 0] : event.key === 'ArrowDown' ? [0, -amount, 0] : event.key === 'PageUp' ? [0, 0, amount] : event.key === 'PageDown' ? [0, 0, -amount] : undefined;
       if (!delta) return;
@@ -1602,7 +1766,7 @@ export default function Home() {
     };
     window.addEventListener('keydown', moveWithKeyboard);
     return () => window.removeEventListener('keydown', moveWithKeyboard);
-  }, [editMode, language, moveStep, selection]);
+  }, [editMode, language, moveStep, selection, showCollisionEditor]);
 
   const changeLanguage = (next: Language) => {
     setLanguage(next);
@@ -1998,7 +2162,7 @@ export default function Home() {
                 <span><b>{modules.length}</b> {t('modules', 'Module')}</span>
                 <span><b>{modularGrid.width}×{modularGrid.height}</b> {t('output cells', 'Ausgabezellen')}</span>
                 <span className={unassignedCount ? 'open' : 'complete'}><b>{unassignedCount}</b> {t('free slots', 'freie Slots')}</span>
-                <span className={modularGrid.collisions.length ? 'collision' : ''}><b>{modularGrid.collisions.length}</b> {t('collisions', 'Kollisionen')}</span>
+                <button className={modularGrid.collisions.length ? 'collision collision-open' : 'collision-open'} onClick={() => setShowCollisionEditor(modularGrid.collisions.length ? 'collisions' : 'pixels')}><b>{modularGrid.collisions.length}</b> {t('collisions · edit pixels', 'Kollisionen · Pixel bearbeiten')}</button>
               </div>
               <div className="canvas-help">{t('Click: select module · Drag: move module · edit exact size and rotation on the right', 'Klick: Modul wählen · Ziehen: Modul verschieben · exakte Größe und Rotation rechts bearbeiten')}</div>
             </>}
@@ -2015,6 +2179,7 @@ export default function Home() {
               <div className="coverage-bar"><i style={{ width: `${points.length ? assignedCount / points.length * 100 : 0}%` }} /></div>
               <small>{unassignedCount ? t(`${unassignedCount} LED slots still need a module.`, `${unassignedCount} LED-Slots benötigen noch ein Modul.`) : t('Every physical LED slot is assigned exactly once.', 'Jeder physische LED-Slot ist genau einmal zugewiesen.')}</small>
             </div>
+            <button className="auto-draft-button" disabled={!modules.length} onClick={() => setShowCollisionEditor('pixels')}>✥ <span><strong>{t('Edit pixels / compact grid', 'Pixel bearbeiten / Raster verdichten')}</strong><small>{t('Select pixels, move them with arrows, or reduce spacing across the whole fixture.', 'Pixel auswählen, per Pfeiltasten verschieben oder Abstände der gesamten Fixture verkleinern.')}</small></span></button>
             <button className="auto-draft-button" onClick={rebuildModuleSuggestions}>◇ <span><strong>{t('Suggest modules from scan', 'Module aus Scan vorschlagen')}</strong><small>{t('Detect matrices and strip changes; preserve crossed or differently oriented scan paths.', 'Matrizen und Strangwechsel erkennen; gekreuzte oder unterschiedlich ausgerichtete Scan-Pfade beibehalten.')}</small></span></button>
             <button className="auto-draft-button scan-layout-button" disabled={!modules.length} onClick={alignModulesToCurrentScanView}>⌁ <span><strong>{t('Match current 3D arrangement', 'Aktuelle 3D-Anordnung übernehmen')}</strong><small>{t('Keep the modules and copy their relative position, rotation and projected size from the retained 3D camera.', 'Module beibehalten und relative Position, Rotation sowie projizierte Größe aus der gespeicherten 3D-Kamera übernehmen.')}</small></span></button>
             <div className="free-ranges"><span>{t('Free contiguous ranges', 'Freie zusammenhängende Bereiche')}</span><div>{freeRanges.length ? freeRanges.map(range => <button key={range.first} onClick={() => { setSelection([range.first]); setStageMode('3d'); }}>{`#${range.first + 1}–${range.last + 1}`} <b>{range.last - range.first + 1}</b></button>) : <em>{t('none', 'keine')}</em>}</div></div>
@@ -2087,10 +2252,15 @@ export default function Home() {
         <div className="modal-actions"><button className="secondary-button" onClick={() => { setShowRepair(false); setRepairSuggestions([]); setMessage(t('Repair suggestions discarded — original data unchanged.', 'Reparaturvorschläge verworfen — Originaldaten unverändert.')); }}>{t('Cancel', 'Abbrechen')}</button><button className="primary-button repair-apply" disabled={!selectedRepairCount} onClick={applyRepairs}>{t(`Apply ${selectedRepairCount} selected`, `${selectedRepairCount} ausgewählte anwenden`)}</button></div>
       </section></div>}
 
+      {showCollisionEditor && <PixelCollisionEditor modules={modules} channels={settings.channels} language={language} mode={showCollisionEditor} onClose={() => setShowCollisionEditor(null)} onApply={updated => {
+        setModules(updated); setShowCollisionEditor(null); setStageMode('builder'); setShowExport(true);
+        setMessage(t('Fixture pixel changes applied. Original scan coordinates and channel addresses are unchanged.', 'Fixture-Pixeländerungen übernommen. Originale Scankoordinaten und Kanaladressen sind unverändert.'));
+      }} />}
       {showExport && <div className="modal-backdrop" onMouseDown={() => setShowExport(false)}><section className="modal" onMouseDown={event => event.stopPropagation()} aria-modal="true" role="dialog" aria-labelledby="export-title">
         <button className="modal-close" aria-label={t('Close', 'Schließen')} onClick={() => setShowExport(false)}>×</button><span className="eyebrow">EXPORT</span><h2 id="export-title">{t('Create MadMapper fixture', 'MadMapper Fixture erstellen')}</h2><p className="modal-lead">{t('MMFL uses the modular output grid. SVG and CSV continue to use the enabled scan regions.', 'MMFL verwendet das modulare Ausgaberaster. SVG und CSV verwenden weiterhin die aktivierten Scan-Bereiche.')}</p>
         <div className="export-summary"><span>{t('Modules', 'Module')}<b>{modules.length}</b></span><span>{t('Assigned', 'Zugewiesen')}<b>{assignedCount}/{points.length}</b></span><span>{t('Hidden', 'Ausgeblendet')}<b>{hiddenIndices.length}</b></span><span>{t('Grid', 'Raster')}<b>{modularGrid.width}×{modularGrid.height}</b></span><span className={modularGrid.collisions.length ? 'bad' : ''}>{t('Collisions', 'Kollisionen')}<b>{modularGrid.collisions.length}</b></span></div>
         {modularGrid.collisions.length > 0 && <p role="alert">{t('Overlapping display pixel numbers (CSV index + 1)', 'Überlappende angezeigte Pixelnummern (CSV-Index + 1)')}: {modularGrid.collisions.slice(0, 12).join(', ')}. {t('Check these scan positions. Strands are not moved automatically to hide ambiguous readings.', 'Prüfe diese Scanpositionen. Streifen werden nicht automatisch verschoben, um unklare Messwerte zu verdecken.')}</p>}
+        <button className="secondary-button" onClick={() => { setShowExport(false); setShowCollisionEditor(modularGrid.collisions.length ? 'collisions' : 'pixels'); }}>{modularGrid.collisions.length ? t('Fix collisions / edit pixels', 'Kollisionen korrigieren / Pixel bearbeiten') : t('Edit pixels / compact grid', 'Pixel bearbeiten / Raster verdichten')}</button>
         <div className="form-grid"><label>Fixture Definition<input value={settings.definition} onChange={event => setSettings(current => ({ ...current, definition: event.target.value }))} /></label><label>{t('Channels per pixel', 'Kanäle pro Pixel')}<select value={settings.channels} onChange={event => setSettings(current => ({ ...current, channels: Number(event.target.value), definition: Number(event.target.value) === 4 ? 'Generic - Pixel RGBW' : 'Generic - Pixel RGB' }))}><option value={3}>RGB · 3</option><option value={4}>RGBW · 4</option></select></label><label>{t('Start universe', 'Start Universe')}<input type="number" min="0" max="32767" value={settings.universe} onChange={event => setSettings(current => ({ ...current, universe: Math.max(0, Number(event.target.value)) }))} /></label><label>{t('Start channel', 'Start Channel')}<input type="number" min="1" max="512" value={settings.channel} onChange={event => setSettings(current => ({ ...current, channel: Math.max(1, Math.min(512, Number(event.target.value))) }))} /></label><label>{t('Pixel size in MadMapper', 'Pixelgröße in MadMapper')}<input type="number" min="1" max="64" value={settings.ledSize} onChange={event => setSettings(current => ({ ...current, ledSize: Math.max(1, Number(event.target.value)) }))} /></label></div>
         <p className="file-name-preview">{t('Saved as', 'Wird gespeichert als')}: <strong>{safeName(settings.definition)}.[svg/csv/mmfl]</strong></p>
         <div className="format-cards"><button onClick={() => exportFile('svg')}><b>SVG 6.1</b><span>{t('Freeform', 'Freiform')}</span><small>{t('Exact projected positions and DMX patch from enabled scan regions.', 'Exakte projizierte Positionen und DMX-Patch aus aktivierten Scan-Bereichen.')}</small></button><button onClick={() => exportFile('csv')}><b>CSV</b><span>{t('Table', 'Tabelle')}</span><small>{t('Individual fixtures with position, definition and patch.', 'Einzel-Fixtures mit Position, Definition und Patch.')}</small></button><button disabled={unassignedCount > 0 || modularGrid.collisions.length > 0} onClick={() => exportFile('mmfl')}><b>MMFL</b><span>{t('Modular grid', 'Modulraster')}</span><small>{unassignedCount ? t(`Assign ${unassignedCount} remaining LED slots first.`, `Weise zuerst die ${unassignedCount} übrigen LED-Slots zu.`) : modularGrid.collisions.length ? t(`Resolve ${modularGrid.collisions.length} grid collisions first.`, `Löse zuerst ${modularGrid.collisions.length} Rasterkollisionen.`) : t('Ready: hidden pixels remain empty while reserving their original channel offsets.', 'Bereit: ausgeblendete Pixel bleiben leer und reservieren ihre ursprünglichen Kanalabstände.')}</small></button></div>

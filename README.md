@@ -22,6 +22,8 @@ The hosted app currently uses access-controlled Sites hosting. Everyone can run 
 - Scan-assisted zigzag, row/column flow, and start-corner detection with manual overrides
 - Immediate module draft after CSV import: repeated row returns become matrices, serpentine reversals determine likely row length, and unmatched runs remain strips
 - Per-module X/Y placement, physical width/height, rotation, and an export-exact MMFL preview
+- Individual or multi-pixel grid editing with arrow keys, number-range selection, and preview-before-apply collision checks
+- Whole-fixture grid scaling to reduce empty spacing, separate from viewport zoom
 - Scan-view layout transfer: suggested modules inherit their relative centre, projected orientation, and size from the retained 3D camera, with one-click re-alignment after rotating the scan
 - Strict coverage rules: each imported LED slot is assigned once, and only modules that fit a remaining contiguous range can be added
 - Reserved hidden LEDs remain part of the wiring order and DMX address spacing without rendering a visible MMFL cell
@@ -46,6 +48,10 @@ Start a module at the next free slot or at the first LED selected in the 3D scan
 ### 3. Arrange the output grid
 
 Drag complete modules in the large 2D builder, then enter exact X/Y positions, physical width and height, and rotation. The preview and MMFL exporter share the same rounded grid, so collisions are visible before export and block an invalid MMFL download.
+
+Use **Edit pixels / compact grid** to adjust individual LEDs without moving their complete module. Click a pixel, use Ctrl/Command or Shift-click for multiple selection, or enter displayed pixel numbers such as `1-20, 35`. Arrow keys and the on-screen arrows move the selection by one output cell. Displayed numbers are one-based; the selected LED's original zero-based CSV index and channel offset are shown alongside them.
+
+**Fixture grid scale** below 100% reduces spacing across the entire fixture and rounds the result onto the output grid. **View zoom** only magnifies the preview. Newly overlapping pixels appear in orange and can be selected using the collision buttons; resolve new overlaps before applying. **Cancel** discards the draft, while **Apply correction** updates the MMFL layout only. Original 3D coordinates and source/DMX addresses stay unchanged. Generating new module suggestions replaces these manual fixture corrections.
 
 Pixels that exist physically but must never light can be marked hidden on their module. A hidden pixel stays visible as a crossed placeholder in the editor and continues to consume its source index and channel offset. The MMFL cell is written as `0`; every later mapped cell is still calculated from its original source index. This is the compatibility approach used because MMFL does not publicly document a dedicated hidden-pixel flag.
 
